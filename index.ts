@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -135,43 +135,6 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		return matches.length === 1 ? matches[0] : undefined;
 	}
 
-	function ensureSkillResourceLinks(cwd: string) {
-		for (const skill of skills.values()) {
-			for (const resourceDir of RESOURCE_DIRS) {
-				const sourceRoot = join(skill.baseDir, resourceDir);
-				if (!existsSync(sourceRoot)) continue;
-
-				const linkFiles = (dir: string, relDir = "") => {
-					let entries: ReturnType<typeof readdirSync>;
-					try {
-						entries = readdirSync(dir, { withFileTypes: true });
-					} catch {
-						return;
-					}
-
-					for (const entry of entries) {
-						const source = join(dir, entry.name);
-						const rel = join(relDir, entry.name);
-						const target = join(cwd, resourceDir, rel);
-						if (entry.isDirectory()) {
-							linkFiles(source, rel);
-							continue;
-						}
-						try {
-							if (existsSync(target)) continue;
-							mkdirSync(dirname(target), { recursive: true });
-							symlinkSync(source, target);
-						} catch {
-							// Never let convenience symlink creation break agent startup.
-						}
-					}
-				};
-
-				linkFiles(sourceRoot);
-			}
-		}
-	}
-
 	function cwdPathExists(cwd: string, relPath: string): boolean {
 		return !isAbsolute(relPath) && existsSync(resolve(cwd, relPath));
 	}
@@ -199,7 +162,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		// Fix paths relative to the skill root, e.g. scripts/exa.sh or
 		// reference/troubleshooting.md, when the target is unique across skills.
 		const dirs = RESOURCE_DIRS.join("|");
-		const resourceRegex = new RegExp("(^|[\\\\s\\\"'(=;|&])((?:\\\\./)?(?:" + dirs + ")\\\\/[^\\\\s\\\"'`;|&<>)]*)", "g");
+		const resourceRegex = new RegExp("(^|[\\s\\\"'(=;|&])((?:\\./)?(?:" + dirs + ")/[^\\s\\\"'`;|&<>)]*)", "g");
 		rewritten = rewritten.replace(resourceRegex, (match, prefix: string, relPath: string) => {
 			if (isAbsolute(relPath) || cwdPathExists(cwd, relPath)) return match;
 			const absolute = resolveRelativeResource(relPath);
@@ -258,18 +221,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
-		ensureSkillResourceLinks(ctx.cwd);
 	});
 
 	pi.on("resources_discover", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
-		ensureSkillResourceLinks(ctx.cwd);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
 		refreshSkills(ctx.cwd, loaded);
-		ensureSkillResourceLinks(ctx.cwd);
 		return {
 			systemPrompt:
 				event.systemPrompt +

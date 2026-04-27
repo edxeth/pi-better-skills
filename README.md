@@ -59,19 +59,11 @@ scripts/alphaxiv.sh search "agent skills" 8
 reference/troubleshooting.md
 ```
 
-### cwd-local resource symlinks
+### No workspace mutation
 
-On session start and resource discovery, the extension creates convenience symlinks from the current pi cwd back to skill resources when those target paths do not already exist.
+The extension resolves skill resources through tool-call rewriting and `$PI_SKILL_DIR` guidance. It does not create files or symlinks in the current pi cwd.
 
-For example, if pi is launched from `/tmp`, the extension may create:
-
-```text
-/tmp/scripts/exa.sh -> ~/.pi/agent/skills/exa/scripts/exa.sh
-```
-
-This lets model-emitted commands that follow a skill literally still work, even if pi was launched outside the skill directory.
-
-Existing files are never overwritten. If the project already has `scripts/foo.sh`, that project script wins over any skill script with the same relative path.
+If the project already has `scripts/foo.sh`, that project script wins over any skill script with the same relative path.
 
 ### Sibling skill path handling
 
