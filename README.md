@@ -10,13 +10,19 @@ This extension makes those skill resources behave more like they do in Claude Co
 
 ### Skill-local base directory context
 
-When a `SKILL.md` is read, the extension prepends a small skill-local context block, similar to Claude Code / OpenClaude:
+When a `SKILL.md` is read, the extension inserts a small skill-local context block after YAML frontmatter when present, or at the top otherwise, similar to Claude Code / OpenClaude:
 
 ```xml
 <skill_context>
-Base directory for this skill: /path/to/skill
-Workspace directory: /path/to/workspace
-Use $PI_SKILL_DIR for bundled skill files. Use $PI_WORKSPACE for workspace files.
+  <skill_dir>/path/to/skill</skill_dir>
+  <workspace_dir>/path/to/workspace</workspace_dir>
+
+  <path_policy>
+    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.
+    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.
+    Use $PI_SKILL_DIR/path for explicit bundled skill files.
+    Use $PI_WORKSPACE/path for explicit workspace/project files.
+  </path_policy>
 </skill_context>
 ```
 
@@ -27,26 +33,26 @@ This is the primary way the model learns where the active skill lives. It is loc
 The extension also appends a small XML-scoped block to the system prompt:
 
 ```xml
-<pi_better_skills>
-  <path_policy>...</path_policy>
+<agent_skills>
+  <path_policy>
+    Relative file references in an active SKILL.md normally resolve from that skill's directory when they exist there.
+    Plain workspace commands like git status, bun test, and git commit usually run in the workspace unless instructed otherwise.
+    Use $PI_SKILL_DIR/path for explicit bundled skill files.
+    Use $PI_WORKSPACE/path for explicit workspace/project files.
+  </path_policy>
   <dynamic_skill_shell>...</dynamic_skill_shell>
-</pi_better_skills>
+</agent_skills>
 ```
 
 This keeps the guidance visually bounded and easier for models to follow without turning it into free-floating prose.
 
 ### Skill-relative resource resolution
 
-When a skill references files under common resource directories, the extension resolves them against the skill root only if the same relative path does not already exist under the current pi cwd. Project/cwd-relative files always take precedence.
+When a `SKILL.md` is active, relative file paths that exist inside that skill are treated as skill-local by default. This means `scripts/exa.sh` from the Exa skill resolves to the Exa skill's bundled script, not to `./scripts/exa.sh` in the current workspace.
 
-Recognized resource directories:
+Plain workspace commands like `git status`, `bun test`, and `git commit` usually run in the workspace unless instructed otherwise. A skill like `commit` can say `git status` or `git commit` and those commands operate on the user's project. If a skill intentionally needs a workspace file that also exists under the active skill directory, it should use `$PI_WORKSPACE/...` explicitly.
 
-- `scripts/`
-- `reference/`
-- `resources/`
-- `assets/`
-- `data/`
-- `templates/`
+The extension does not hardcode directory names. Any relative path token containing a slash can resolve skill-local if that file exists under the active skill directory. Bare commands such as `git`, `bun`, and `rg` are untouched.
 
 Examples that are supported:
 
@@ -63,7 +69,9 @@ reference/troubleshooting.md
 
 The extension resolves skill resources through tool-call rewriting and `$PI_SKILL_DIR` guidance. It does not create files or symlinks in the current pi cwd.
 
-If the project already has `scripts/foo.sh`, that project script wins over any skill script with the same relative path.
+If a `SKILL.md` is active and it has `scripts/foo.sh`, that skill script wins. To run a project script with the same relative path, use `$PI_WORKSPACE/scripts/foo.sh`.
+
+If no active skill is known yet, existing workspace paths are left alone. Otherwise, a unique matching skill resource may be resolved as a fallback.
 
 ### Sibling skill path handling
 
@@ -74,7 +82,7 @@ Composite skills sometimes reference sibling skills, for example:
 ../firecrawl/scripts/firecrawl.sh scrape "https://example.com"
 ```
 
-If the same `../exa/scripts/exa.sh` path exists relative to the current pi cwd, it is left alone. Otherwise, pi's current `tool_call` extension API can block tool execution and mutate arguments, but mutation is not reliable for this case in all observed runs. Therefore, `pi-better-skills` blocks unresolved sibling-skill commands and returns a clear retry instruction with the absolute resolved command.
+If the same `../exa/scripts/exa.sh` path exists relative to the current pi cwd, it is left alone. Otherwise, `pi-better-skills` blocks unresolved sibling-skill commands and returns a clear retry instruction with the absolute resolved command.
 
 The model then retries with the correct absolute path.
 
@@ -187,7 +195,7 @@ scripts/exa.sh search "latest LLM research" 5
 
 They only work if the agent happens to run from the skill directory. But pi normally runs from the user's project directory, or wherever it was launched. That mismatch causes unnecessary failures and model recovery loops.
 
-`pi-better-skills` makes skill-authored resources portable across cwd, while preserving ordinary project/cwd-relative file and script behavior and keeping project-local shell execution behind an explicit trust flag.
+`pi-better-skills` makes skill-authored resources portable across cwd, while preserving ordinary workspace command behavior and keeping project-local shell execution behind an explicit trust flag.
 
 ## Installation
 

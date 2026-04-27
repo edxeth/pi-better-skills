@@ -11,7 +11,6 @@ type SkillRecord = {
 	baseDir: string;
 };
 
-const RESOURCE_DIRS = ["scripts", "reference", "resources", "assets", "data", "templates"];
 const DYNAMIC_BLOCK_PATTERN = /```!\s*\n?([\s\S]*?)\n?```/g;
 const DYNAMIC_INLINE_PATTERN = /(^|\s)!`([^`]+)`/gm;
 const MAX_DYNAMIC_OUTPUT_CHARS = 50_000;
@@ -121,16 +120,49 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	}
 
 	function findSkillForPath(path: string): SkillRecord | undefined {
+		const targetPath = resolve(path);
+		const known = Array.from(skills.values());
+		const exact = known.find((skill) => resolve(skill.filePath) === targetPath);
+		if (exact) return exact;
+
 		const target = realpathOrResolve(path);
-		return Array.from(skills.values()).find((skill) => realpathOrResolve(skill.filePath) === target);
+		const matching = known.find((skill) => realpathOrResolve(skill.filePath) === target);
+		if (path.endsWith("SKILL.md") && existsSync(path)) {
+			const baseDir = dirname(path);
+			return { name: matching?.name ?? baseDir.split(/[\\/]/).pop() ?? "skill", filePath: path, baseDir };
+		}
+		return matching;
 	}
 
-	function resolveRelativeResource(relPath: string): string | undefined {
+	function cleanRelativePath(relPath: string): string | undefined {
+		if (isAbsolute(relPath) || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(relPath) || relPath.startsWith("$")) return undefined;
 		const clean = relPath.replace(/^\.\//, "");
+		if (!clean || clean === "." || clean.startsWith("../")) return undefined;
+		return clean;
+	}
+
+	function isInsideDir(path: string, dir: string): boolean {
+		const target = resolve(path);
+		const root = resolve(dir);
+		return target === root || target.startsWith(`${root}/`);
+	}
+
+	function resolveSkillResource(skill: SkillRecord, relPath: string): string | undefined {
+		const clean = cleanRelativePath(relPath);
+		if (!clean) return undefined;
+		const candidate = resolve(skill.baseDir, clean);
+		return isInsideDir(candidate, skill.baseDir) && existsSync(candidate) ? candidate : undefined;
+	}
+
+	function resolveRelativeResource(relPath: string, preferredSkill?: SkillRecord): string | undefined {
+		if (preferredSkill) return resolveSkillResource(preferredSkill, relPath);
+
+		const clean = cleanRelativePath(relPath);
+		if (!clean) return undefined;
 		const matches: string[] = [];
 		for (const skill of skills.values()) {
-			const candidate = join(skill.baseDir, clean);
-			if (existsSync(candidate)) matches.push(candidate);
+			const candidate = resolve(skill.baseDir, clean);
+			if (isInsideDir(candidate, skill.baseDir) && existsSync(candidate)) matches.push(candidate);
 		}
 		return matches.length === 1 ? matches[0] : undefined;
 	}
@@ -143,6 +175,31 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		let substituted = value.replace(/\$\{PI_WORKSPACE\}|\$PI_WORKSPACE\b/g, cwd);
 		if (skill) substituted = substituted.replace(/\$\{PI_SKILL_DIR\}|\$PI_SKILL_DIR\b/g, skill.baseDir);
 		return substituted;
+	}
+
+	function skillContextBlock(skill: SkillRecord, workspace: string): string {
+		return `<skill_context>\n  <skill_dir>${skill.baseDir}</skill_dir>\n  <workspace_dir>${workspace}</workspace_dir>\n\n  <path_policy>\n    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.\n    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.\n    Use $PI_SKILL_DIR/path for explicit bundled skill files.\n    Use $PI_WORKSPACE/path for explicit workspace/project files.\n  </path_policy>\n</skill_context>`;
+	}
+
+	function insertSkillContext(text: string, skill: SkillRecord, workspace: string): string {
+		if (text.includes("<skill_context>")) return text;
+		const context = skillContextBlock(skill, workspace);
+		const frontmatter = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+		if (!frontmatter) return `${context}\n\n${text}`;
+		const end = frontmatter[0].length;
+		const rest = text.slice(end).replace(/^\r?\n/, "");
+		return `${text.slice(0, end)}\n${context}\n\n${rest}`;
+	}
+
+	function findSkillReferencedByCommand(command: string, cwd: string): SkillRecord | undefined {
+		for (const match of command.matchAll(/(?:^|[\s"'])((?:\.?\.?\/|\/)?[^\s"']*SKILL\.md)\b/g)) {
+			const rawPath = match[1];
+			if (!rawPath) continue;
+			const path = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+			const skill = findSkillForPath(path);
+			if (skill) return skill;
+		}
+		return undefined;
 	}
 
 	function rewriteCommand(command: string, cwd: string): string {
@@ -159,14 +216,16 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			return existsSync(candidate) ? `${prefix}${maybeQuote(candidate, match)}` : match;
 		});
 
-		// Fix paths relative to the skill root, e.g. scripts/exa.sh or
-		// reference/troubleshooting.md, when the target is unique across skills.
-		const dirs = RESOURCE_DIRS.join("|");
-		const resourceRegex = new RegExp("(^|[\\s\\\"'(=;|&])((?:\\./)?(?:" + dirs + ")/[^\\s\\\"'`;|&<>)]*)", "g");
-		rewritten = rewritten.replace(resourceRegex, (match, prefix: string, relPath: string) => {
-			if (isAbsolute(relPath) || cwdPathExists(cwd, relPath)) return match;
-			const absolute = resolveRelativeResource(relPath);
-			return absolute ? `${prefix}${maybeQuote(absolute, match)}` : match;
+		// Fix relative path tokens against the active skill root when that file
+		// exists inside the skill. Tool cwd stays the workspace, and bare commands
+		// like git/bun/rg are untouched because they contain no slash.
+		const relativePathRegex = /(^|[\s\"'(=;|&])((?:\.\/)?[^\s\"'`;|&<>)]*\/[^\s\"'`;|&<>)]*)/g;
+		rewritten = rewritten.replace(relativePathRegex, (match, prefix: string, relPath: string) => {
+			const absolute = resolveRelativeResource(relPath, activeSkill);
+			if (absolute) return `${prefix}${maybeQuote(absolute, match)}`;
+			if (activeSkill || cwdPathExists(cwd, relPath)) return match;
+			const uniqueSkillResource = resolveRelativeResource(relPath);
+			return uniqueSkillResource ? `${prefix}${maybeQuote(uniqueSkillResource, match)}` : match;
 		});
 
 		return rewritten;
@@ -235,10 +294,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				event.systemPrompt +
 				`\n\n<agent_skills>
   <path_policy>
-    Workspace-relative paths run from the current pi workspace.
-    Skill references are relative to the skill directory shown in the loaded skill block.
-    Use $PI_SKILL_DIR/path when an explicit bundled-skill path is needed.
-    Existing skill docs using scripts/... or reference/... are supported; do not explain or rewrite them unless a tool call fails or the path is ambiguous.
+    Relative file references in an active SKILL.md normally resolve from that skill's directory when they exist there.
+    Plain workspace commands like \`git status\` and \`bun test\` usually run in the workspace unless instructed otherwise.
+    Use $PI_SKILL_DIR/path for explicit bundled skill files.
+    Use $PI_WORKSPACE/path for explicit workspace/project files.
     Absolute paths are exact and should not be reinterpreted.
   </path_policy>
   <dynamic_skill_shell>
@@ -256,6 +315,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			const original = input.command;
 			process.env.PI_WORKSPACE = ctx.cwd;
 			if (activeSkill) process.env.PI_SKILL_DIR = activeSkill.baseDir;
+			else delete process.env.PI_SKILL_DIR;
 			if (/\$\{PI_SKILL_DIR\}|\$PI_SKILL_DIR\b/.test(original) && !activeSkill) {
 				return {
 					block: true,
@@ -291,18 +351,31 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 					reason: `Blocked unresolved PI path variable. Retry read with the resolved path: ${resolved}`,
 				};
 			}
-			if (!isAbsolute(input.path) && !cwdPathExists(ctx.cwd, input.path)) {
-				const absolute = resolveRelativeResource(input.path);
+			if (!isAbsolute(input.path)) {
+				const absolute = resolveRelativeResource(input.path, activeSkill);
 				if (absolute) input.path = absolute;
+				else if (!activeSkill && !cwdPathExists(ctx.cwd, input.path)) {
+					const uniqueSkillResource = resolveRelativeResource(input.path);
+					if (uniqueSkillResource) input.path = uniqueSkillResource;
+				}
 			}
 		}
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName !== "read" || event.isError) return;
-		const inputPath = typeof event.input.path === "string" ? event.input.path : undefined;
-		if (!inputPath) return;
-		const skill = findSkillForPath(inputPath);
+		if (event.isError) return;
+
+		let skill: SkillRecord | undefined;
+		if (event.toolName === "read") {
+			const inputPath = typeof event.input.path === "string" ? event.input.path : undefined;
+			if (inputPath) skill = findSkillForPath(inputPath);
+		} else if (event.toolName === "bash") {
+			const command = typeof event.input.command === "string" ? event.input.command : undefined;
+			if (command) skill = findSkillReferencedByCommand(command, ctx.cwd);
+		} else {
+			return;
+		}
+
 		if (!skill) return;
 		activeSkill = skill;
 
@@ -313,9 +386,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				if (block.type !== "text") return block;
 				let text = block.text;
 				if (!addedSkillContext) {
-					text = `<skill_context>\nBase directory for this skill: ${skill.baseDir}\nWorkspace directory: ${ctx.cwd}\nUse $PI_SKILL_DIR for bundled skill files. Use $PI_WORKSPACE for workspace files.\n</skill_context>\n\n${text}`;
+					text = insertSkillContext(text, skill, ctx.cwd);
 					addedSkillContext = true;
-					changed = true;
+					changed = text !== block.text;
 				}
 				text = await executeDynamicShell(text, skill, ctx.cwd);
 				if (text !== block.text) changed = true;
