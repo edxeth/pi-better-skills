@@ -1,102 +1,150 @@
 # pi-better-skills
 
-`pi-better-skills` improves pi's Agent Skills runtime behavior for skills that ship scripts, reference files, and dynamic prompt content.
+`pi-better-skills` makes pi skills feel reliable instead of fragile.
 
-The extension exists because many skills are authored as if their `SKILL.md` is the working directory. In practice, pi may be launched from anywhere, such as `/tmp` or a project root, so documented commands like `scripts/exa.sh ...` or references like `reference/troubleshooting.md` can fail unless the model manually resolves the path against the skill directory.
+Pi already supports Agent Skills: small capability packages with a `SKILL.md`, helper scripts, and reference files. That is powerful, but there is a practical mismatch: pi runs tools from your current workspace, while many skills are written as if commands and links are relative to the skill folder.
 
-This extension makes those skill resources behave more like they do in Claude Code / OpenClaude-inspired skill runtimes.
-
-## Features
-
-### Skill-local base directory context
-
-When a `SKILL.md` is read, the extension inserts a small skill-local context block after YAML frontmatter when present, or at the top otherwise, similar to Claude Code / OpenClaude:
-
-```xml
-<skill_context>
-  <skill_dir>/path/to/skill</skill_dir>
-  <workspace_dir>/path/to/workspace</workspace_dir>
-
-  <path_policy>
-    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.
-    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.
-    Use $PI_SKILL_DIR/path for explicit bundled skill files.
-    Use $PI_WORKSPACE/path for explicit workspace/project files.
-  </path_policy>
-</skill_context>
-```
-
-This is the primary way the model learns where the active skill lives. It is local to the skill content instead of being only global policy.
-
-### XML-scoped system guidance
-
-The extension also appends a small XML-scoped block to the system prompt:
-
-```xml
-<agent_skills>
-  <path_policy>
-    Relative file references in an active SKILL.md normally resolve from that skill's directory when they exist there.
-    Plain workspace commands like git status, bun test, and git commit usually run in the workspace unless instructed otherwise.
-    Use $PI_SKILL_DIR/path for explicit bundled skill files.
-    Use $PI_WORKSPACE/path for explicit workspace/project files.
-  </path_policy>
-  <dynamic_skill_shell>...</dynamic_skill_shell>
-</agent_skills>
-```
-
-This keeps the guidance visually bounded and easier for models to follow without turning it into free-floating prose.
-
-### Skill-relative resource resolution
-
-When a `SKILL.md` is active, relative file paths that exist inside that skill are treated as skill-local by default. This means `scripts/exa.sh` from the Exa skill resolves to the Exa skill's bundled script, not to `./scripts/exa.sh` in the current workspace.
-
-Plain workspace commands like `git status`, `bun test`, and `git commit` usually run in the workspace unless instructed otherwise. A skill like `commit` can say `git status` or `git commit` and those commands operate on the user's project. If a skill intentionally needs a workspace file that also exists under the active skill directory, it should use `$PI_WORKSPACE/...` explicitly.
-
-The extension does not hardcode directory names. Any relative path token containing a slash can resolve skill-local if that file exists under the active skill directory. Bare commands such as `git`, `bun`, and `rg` are untouched.
-
-Examples that are supported:
+That mismatch is easy to miss until a skill says something like:
 
 ```bash
-scripts/exa.sh search "query" 5
-scripts/alphaxiv.sh search "agent skills" 8
+scripts/search.sh "query"
 ```
+
+and the agent tries to run `./scripts/search.sh` in your project instead of the skill's bundled `scripts/search.sh`. The result is usually a failed command, a confused retry, or the model wasting context explaining paths to itself.
+
+This extension exists to remove that friction.
+
+## What it solves
+
+### Skills can bundle real tools
+
+Good skills are more than prompt text. They often include scripts, examples, templates, reference markdown, or small CLIs. `pi-better-skills` helps the agent find those bundled resources from any project directory.
+
+That means a skill can safely say:
+
+```bash
+scripts/exa.sh search "agent skills" 5
+```
+
+or:
+
+```md
+Read reference/troubleshooting.md before continuing.
+```
+
+and the agent gets pointed at the resource inside the active skill, not a coincidentally named file in the workspace.
+
+### Less path babysitting
+
+Without this extension, users and skill authors have to over-explain paths:
+
+- “First cd into the skill directory.”
+- “Use the absolute path to this script.”
+- “Do not run this from the project root.”
+- “If it fails, retry with `/home/.../skills/...`.”
+
+`pi-better-skills` injects skill-local context when a `SKILL.md` is loaded, so the model sees where the skill lives and which paths belong to the skill versus the workspace.
+
+### Better compatibility with Claude Code-style skills
+
+Many useful skills are authored for runtimes where skill markdown has a clear base directory and can include dynamic shell snippets. Pi's core keeps skills deliberately simple and asks the model to resolve relative paths itself.
+
+This extension adds the missing ergonomics without forking pi:
+
+- skill-local directory awareness
+- safer skill-resource path resolution
+- `PI_SKILL_DIR` and `PI_WORKSPACE` variables
+- dynamic `SKILL.md` shell placeholders for trusted skills
+
+### Fewer model recovery loops
+
+The main benefit is not fancy path rewriting. The benefit is fewer bad first tool calls.
+
+When skills can refer to their own files naturally, the agent spends less time recovering from “file not found” and more time doing the workflow the skill was written for.
+
+## When to use it
+
+Install this if you use skills that include any of the following:
+
+- `scripts/` helpers
+- `references/` markdown
+- templates, assets, examples, fixtures, or config files
+- composite skills that call sibling skills
+- Claude Code / OpenClaude-inspired skills
+- dynamic prompt content such as ``!`git branch --show-current` `` inside `SKILL.md`
+
+You probably do not need it for skills that are only a short prompt with no bundled files.
+
+## How to use it well
+
+### As a user
+
+Use skills normally:
 
 ```text
-reference/troubleshooting.md
+/skill:deep-research compare current browser automation libraries
 ```
 
-### No workspace mutation
+or ask pi naturally:
 
-The extension resolves skill resources through tool-call rewriting and `$PI_SKILL_DIR` guidance. It does not create files or symlinks in the current pi cwd.
+```text
+Research the latest approaches to browser-use agents.
+```
 
-If a `SKILL.md` is active and it has `scripts/foo.sh`, that skill script wins. To run a project script with the same relative path, use `$PI_WORKSPACE/scripts/foo.sh`.
+When the agent loads a matching skill, `pi-better-skills` adds the missing path context automatically. You should not need to tell the model where the skill folder is.
 
-If no active skill is known yet, existing workspace paths are left alone. Otherwise, a unique matching skill resource may be resolved as a fallback.
+After installing or editing the extension in an existing pi session, reload pi:
 
-### Sibling skill path handling
+```text
+/reload
+```
 
-Composite skills sometimes reference sibling skills, for example:
+### As a skill author
+
+Write skills as if `SKILL.md` is the home base for bundled resources.
+
+Good:
+
+````md
+Run the helper:
 
 ```bash
-../exa/scripts/exa.sh search "query" 10
-../firecrawl/scripts/firecrawl.sh scrape "https://example.com"
+scripts/search.sh "{{query}}"
 ```
 
-If the same `../exa/scripts/exa.sh` path exists relative to the current pi cwd, it is left alone. Otherwise, `pi-better-skills` blocks unresolved sibling-skill commands and returns a clear retry instruction with the absolute resolved command.
+If it fails, read reference/troubleshooting.md.
+````
 
-The model then retries with the correct absolute path.
+Also good when you want to be explicit:
 
-### Dynamic shell placeholders in `SKILL.md`
+```bash
+$PI_SKILL_DIR/scripts/search.sh "query"
+```
 
-The extension supports Claude Code-style dynamic prompt placeholders inside trusted `SKILL.md` files.
+Use `$PI_WORKSPACE` when you mean the user's current working dir:
 
-Inline syntax:
+```bash
+$PI_WORKSPACE/scripts/build.sh
+```
+
+Keep ordinary project commands ordinary:
+
+```bash
+git status
+bun test
+```
+
+Those should still run in the user's workspace, not in the skill folder.
+
+### For dynamic skill content
+
+Trusted global skills can include shell placeholders that are evaluated when the agent reads `SKILL.md`:
 
 ```md
 Current branch: !`git branch --show-current`
 ```
 
-Fenced syntax:
+or:
 
 ````md
 Changed files:
@@ -105,110 +153,41 @@ git diff --name-only
 ```
 ````
 
-When the model reads a trusted `SKILL.md`, the extension replaces those placeholders with command output before the model sees the content.
+Dynamic commands run from the current workspace and receive:
 
-Dynamic shell commands run with:
+- `PI_SKILL_DIR` — the active skill directory
+- `PI_WORKSPACE` — the current pi workspace
 
-- `cwd` set to the current pi workspace
-- `PI_SKILL_DIR` set to the skill directory
-- `PI_WORKSPACE` set to the current pi workspace
+Use this for lightweight context that genuinely helps the workflow. Do not use it for slow setup, long-running processes, or surprising side effects.
 
-The extension also supports `${PI_SKILL_DIR}` and `${PI_WORKSPACE}` substitution inside dynamic command text.
+## Trust and safety
 
-Use only these extension-provided names:
+Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.
 
-- `PI_SKILL_DIR` for bundled skill files
-- `PI_WORKSPACE` for the current project/workspace
-
-### Useful path/environment variables
-
-| Variable | Provided by | Meaning | Use it for |
-|---|---|---|---|
-| `$PI_SKILL_DIR` | `pi-better-skills` | directory containing the active `SKILL.md` | bundled skill scripts/resources |
-| `$PI_WORKSPACE` | `pi-better-skills` | current pi workspace/session cwd | project files from dynamic skill shell |
-| `$PWD` | shell | current shell working directory, changes after `cd` | "where this command is right now" |
-| `$HOME` | system/shell | user home directory | user config and global files |
-| `$PATH` | system/shell | executable lookup path | invoking installed CLIs by name |
-| `$SHELL` | system/shell | user's shell path/name when set | shell-aware diagnostics only |
-| `$USER` | system/shell | current username when set | user-scoped paths/logging |
-| `$TMPDIR` | system/shell, optional | preferred temp directory when set | temporary files; fall back to `/tmp` if unset |
-
-Examples:
-
-```bash
-# Skill-bundled helper
-$PI_SKILL_DIR/scripts/exa.sh search "agent skills" 5
-
-# Workspace/project helper
-$PI_WORKSPACE/scripts/build.sh
-
-# Current shell cwd, which may differ after cd
-pwd && echo "$PWD"
-
-# User-global config/resource
-ls "$HOME/.pi/agent/skills"
-```
-
-For normal bash/read tool calls, `PI_SKILL_DIR` is resolved from the most recently read `SKILL.md`. If no active skill is known yet, read the relevant `SKILL.md` first or use an absolute skill path.
-
-Safety limits:
-
-- command timeout: 30 seconds
-- max output included in prompt: 50,000 characters
-- project-local dynamic shell is opt-in only
-
-## Trust model
-
-Dynamic shell execution is enabled by default only for user/global skill roots:
+For that reason, dynamic shell execution is enabled by default only for user/global skill roots:
 
 - `~/.pi/agent/skills`
 - `~/.agents/skills`
 
-Project-local skills under `.pi/skills` can come from cloned repositories, so their dynamic shell placeholders are skipped by default.
+Project-local skill shell execution is disabled by default because cloned repositories can contain untrusted `.pi/skills` content.
 
-To opt in for project-local skill shell execution:
+To opt in for project-local dynamic shell placeholders:
 
-```zsh
+```bash
 export PI_TRUST_PROJECT_SKILL_SHELL=1
 ```
 
-This is intentionally explicit because a repository-controlled `SKILL.md` could otherwise run arbitrary shell commands just by being read.
+Only do this in repositories you trust.
 
-## Claude Code / OpenClaude inspiration
-
-Claude Code-style skills include two useful runtime ideas:
-
-1. Skill content knows its base directory.
-2. Skill markdown can inject dynamic shell output with `!\`command\`` / fenced shell blocks.
-
-OpenClaude's skill loader similarly stores a skill root, injects base-directory context, substitutes its own skill-directory variable, and executes shell placeholders when skill content is loaded. `pi-better-skills` intentionally uses pi-specific names instead: `PI_SKILL_DIR` and `PI_WORKSPACE`.
-
-`pi-better-skills` brings those ergonomics to pi without forking pi or patching pi's installed node modules. It is implemented entirely as a pi extension.
-
-## Why this exists
-
-Without this extension, skills that document commands like this are fragile:
+## Install
 
 ```bash
-scripts/exa.sh search "latest LLM research" 5
+pi install git:github.com/edxeth/pi-better-skills
 ```
 
-They only work if the agent happens to run from the skill directory. But pi normally runs from the user's project directory, or wherever it was launched. That mismatch causes unnecessary failures and model recovery loops.
-
-`pi-better-skills` makes skill-authored resources portable across cwd, while preserving ordinary workspace command behavior and keeping project-local shell execution behind an explicit trust flag.
-
-## Installation
-
-Folder-style extension location:
-
-```text
-~/.pi/agent/extensions/pi-better-skills/index.ts
-```
-
-pi auto-discovers this folder-style extension. In an existing interactive pi session, run:
+New sessions load it automatically. Existing sessions need:
 
 ```text
 /reload
 ```
 
-New pi sessions load it automatically.

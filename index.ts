@@ -398,14 +398,4 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (changed) return { content };
 	});
 
-	pi.registerCommand("skill-paths", {
-		description: "Show loaded skill directories used for relative path rewriting",
-		handler: async (_args, ctx) => {
-			refreshSkills(ctx.cwd);
-			const lines = Array.from(skills.values())
-				.sort((a, b) => a.name.localeCompare(b.name))
-				.map((skill) => `${skill.name}: ${skill.baseDir}`);
-			ctx.ui.notify(lines.length ? lines.join("\n") : "No skills found", "info");
-		},
-	});
 }
