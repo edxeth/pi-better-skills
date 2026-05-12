@@ -1,18 +1,16 @@
 # pi-better-skills
 
-`pi-better-skills` makes pi skills feel reliable instead of fragile.
+`pi-better-skills` makes Pi skills resolve their bundled files from the skill directory, not from whatever project you are working in.
 
-Pi already supports Agent Skills: small capability packages with a `SKILL.md`, helper scripts, and reference files. That is powerful, but there is a practical mismatch: pi runs tools from your current workspace, while many skills are written as if commands and links are relative to the skill folder.
-
-That mismatch is easy to miss until a skill says something like:
+Pi implements the [Agent Skills standard](https://agentskills.io): small capability packages with a `SKILL.md`, helper scripts, reference files, templates, and assets. Many skills assume relative paths start at the skill folder. Pi runs tools from your current workspace, so a skill can say:
 
 ```bash
 scripts/search.sh "query"
 ```
 
-and the agent tries to run `./scripts/search.sh` in your project instead of the skill's bundled `scripts/search.sh`. The result is usually a failed command, a confused retry, or the model wasting context explaining paths to itself.
+and the agent may try `./scripts/search.sh` in your project instead of the skill's own `scripts/search.sh`.
 
-This extension exists to remove that friction.
+This extension gives the model the missing path context.
 
 ## What it solves
 
@@ -45,22 +43,16 @@ Without this extension, users and skill authors have to over-explain paths:
 
 `pi-better-skills` injects skill-local context when a `SKILL.md` is loaded, so the model sees where the skill lives and which paths belong to the skill versus the workspace.
 
-### Better compatibility with Claude Code-style skills
+### Better compatibility with Agent Skills
 
-Many useful skills are authored for runtimes where skill markdown has a clear base directory and can include dynamic shell snippets. Pi's core keeps skills deliberately simple and asks the model to resolve relative paths itself.
+Pi implements the Agent Skills standard, where `SKILL.md` can refer to bundled scripts, references, templates, and assets.
 
-This extension adds the missing ergonomics without forking pi:
+Pi core keeps skills simple and asks the model to resolve relative paths itself. `pi-better-skills` adds the path ergonomics skill authors expect:
 
 - skill-local directory awareness
 - safer skill-resource path resolution
-- `PI_SKILL_DIR` and `PI_WORKSPACE` variables
+- `PI_SKILL_DIR` and `PI_WORKSPACE`
 - dynamic `SKILL.md` shell placeholders for trusted skills
-
-### Fewer model recovery loops
-
-The main benefit is not fancy path rewriting. The benefit is fewer bad first tool calls.
-
-When skills can refer to their own files naturally, the agent spends less time recovering from “file not found” and more time doing the workflow the skill was written for.
 
 ## When to use it
 
@@ -70,7 +62,7 @@ Install this if you use skills that include any of the following:
 - `references/` markdown
 - templates, assets, examples, fixtures, or config files
 - composite skills that call sibling skills
-- Claude Code / OpenClaude-inspired skills
+- skills authored for the Agent Skills standard
 - dynamic prompt content such as ``!`git branch --show-current` `` inside `SKILL.md`
 
 You probably do not need it for skills that are only a short prompt with no bundled files.
