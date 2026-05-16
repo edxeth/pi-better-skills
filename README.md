@@ -152,6 +152,50 @@ Dynamic commands run from the current workspace and receive:
 
 Use this for lightweight context that genuinely helps the workflow. Do not use it for slow setup, long-running processes, or surprising side effects.
 
+## Model and thinking overrides
+
+Skills can request a model switch or thinking level change by adding frontmatter fields to `SKILL.md`:
+
+```yaml
+---
+name: my-skill
+description: Heavy analysis task.
+model: anthropic/claude-sonnet-4-6
+thinking: high
+---
+```
+
+When the agent loads the skill, `pi-better-skills` switches to that model and thinking level. Both fields are optional. Omit one to leave it unchanged.
+
+Valid thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+
+The switch lasts for one user request. After the agent finishes responding, the original model and thinking level are restored. Sequential skill reads within one request stack correctly — restoring walks back through each override.
+
+### What gets skipped
+
+| Condition | Behavior |
+|-----------|----------|
+| Model doesn't exist in registry | Skipped, no crash |
+| No auth configured for model | Skipped, no crash |
+| Invalid thinking level | Skipped, no crash |
+| Current context exceeds target model's window | Skipped, no crash |
+
+Invalid values produce a UI notification when pi runs interactively. In print or RPC mode they fail silently.
+
+### Model naming
+
+Use `provider/model-id` format. Match the string you'd pass to `--model`:
+
+```yaml
+model: anthropic/claude-sonnet-4-6
+model: openai/gpt-5.4-mini
+model: google/gemini-3.1-pro-preview
+```
+
+### Context window safety
+
+If the running session has more tokens than the target model's `contextWindow`, the model switch is skipped. You can't accidentally shrink the window and lose context.
+
 ## Trust and safety
 
 Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.

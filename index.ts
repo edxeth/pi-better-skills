@@ -3,7 +3,7 @@ import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 type SkillRecord = {
 	name: string;
@@ -14,6 +14,7 @@ type SkillRecord = {
 const DYNAMIC_BLOCK_PATTERN = /```!\s*\n?([\s\S]*?)\n?```/g;
 const DYNAMIC_INLINE_PATTERN = /(^|\s)!`([^`]+)`/gm;
 const MAX_DYNAMIC_OUTPUT_CHARS = 50_000;
+const VALID_THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 const execAsync = promisify(exec);
 
 function homePath(path: string): string {
@@ -89,9 +90,138 @@ function formatShellOutput(stdout: string, stderr: string): string {
 	return output.length > MAX_DYNAMIC_OUTPUT_CHARS ? `${output.slice(0, MAX_DYNAMIC_OUTPUT_CHARS)}\n[output truncated]` : output;
 }
 
+/**
+ * Extract `model` and `thinking` fields from YAML frontmatter.
+ * Returns undefined fields if not present or unparseable.
+ */
+function extractFrontmatterFields(text: string): { model?: string; thinking?: string } {
+	const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	if (!match) return {};
+	const yamlBlock = match[1];
+	const result: { model?: string; thinking?: string } = {};
+
+	const modelMatch = yamlBlock.match(/^model:\s*(.+)$/m);
+	if (modelMatch) {
+		result.model = modelMatch[1].trim().replace(/^["']|["']$/g, "").trim();
+	}
+
+	const thinkingMatch = yamlBlock.match(/^thinking:\s*(.+)$/m);
+	if (thinkingMatch) {
+		result.thinking = thinkingMatch[1].trim().replace(/^["']|["']$/g, "").trim();
+	}
+
+	return result;
+}
+
 export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skills = new Map<string, SkillRecord>();
 	let activeSkill: SkillRecord | undefined;
+
+	// ---------------------------------------------------------------------------
+	// Model/thinking override state
+	// ---------------------------------------------------------------------------
+	// Tracks temporary model/thinking switches from SKILL.md frontmatter.
+	// Originals are captured before the first override and restored on agent_end.
+	// A simple counter handles sequential reads (composite skills): each load that
+	// applies a valid override increments the counter; agent_end restores only when
+	// the counter reaches zero.
+
+	let overrideCount = 0;
+	let originalModelRef: { provider: string; id: string } | undefined;
+	let originalThinking: string | undefined;
+
+	async function applyModelOverride(modelStr: string, ctx: ExtensionContext): Promise<boolean> {
+		if (!modelStr.includes("/")) return false;
+
+		const slashIndex = modelStr.indexOf("/");
+		const provider = modelStr.slice(0, slashIndex);
+		const modelId = modelStr.slice(slashIndex + 1);
+		const model = ctx.modelRegistry.find(provider, modelId);
+
+		if (!model) {
+			if (ctx.hasUI) ctx.ui.notify(`Skill references unknown model: ${modelStr}`, "warning");
+			return false;
+		}
+
+		if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+			if (ctx.hasUI) ctx.ui.notify(`Skill wants model ${modelStr} but auth is not configured`, "warning");
+			return false;
+		}
+
+		// Context window safety: skip if current usage exceeds the target model's window
+		const currentModel = ctx.model;
+		const usage = ctx.getContextUsage();
+		if (currentModel && usage?.tokens != null && usage.tokens > model.contextWindow) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Skill wants model ${modelStr} but context (${usage.tokens} tokens) exceeds its window (${model.contextWindow}). Skipping.`,
+					"warning",
+				);
+			}
+			return false;
+		}
+
+		return await pi.setModel(model as any);
+	}
+
+	async function applySkillOverrides(
+		fields: { model?: string; thinking?: string },
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const modelStr = fields.model;
+		const thinkingStr = fields.thinking;
+		if (!modelStr && !thinkingStr) return;
+
+		// Capture originals on first override within the current nesting scope
+		if (overrideCount === 0) {
+			const currentModel = ctx.model;
+			if (currentModel) {
+				originalModelRef = { provider: currentModel.provider as string, id: currentModel.id };
+			}
+			originalThinking = pi.getThinkingLevel();
+		}
+
+		let applied = false;
+
+		if (modelStr) {
+			const ok = await applyModelOverride(modelStr, ctx);
+			if (ok) applied = true;
+		}
+
+		if (thinkingStr) {
+			if (VALID_THINKING.has(thinkingStr)) {
+				pi.setThinkingLevel(thinkingStr as any);
+				applied = true;
+			} else if (ctx.hasUI) {
+				ctx.ui.notify(`Skill references invalid thinking level: ${thinkingStr}`, "warning");
+			}
+		}
+
+		if (applied) overrideCount++;
+	}
+
+	async function restoreOriginalState(ctx: ExtensionContext): Promise<void> {
+		if (overrideCount === 0) return;
+		overrideCount = 0;
+
+		if (originalModelRef) {
+			const model = ctx.modelRegistry.find(originalModelRef.provider, originalModelRef.id);
+			if (model) {
+				await pi.setModel(model as any);
+			}
+		}
+
+		if (originalThinking) {
+			pi.setThinkingLevel(originalThinking as any);
+		}
+
+		originalModelRef = undefined;
+		originalThinking = undefined;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Skill discovery
+	// ---------------------------------------------------------------------------
 
 	function refreshSkills(cwd: string, loaded?: unknown[]) {
 		const next = new Map<string, SkillRecord>();
@@ -176,6 +306,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (skill) substituted = substituted.replace(/\$\{PI_SKILL_DIR\}|\$PI_SKILL_DIR\b/g, skill.baseDir);
 		return substituted;
 	}
+
+	// ---------------------------------------------------------------------------
+	// Skill context injection
+	// ---------------------------------------------------------------------------
 
 	function skillContextBlock(skill: SkillRecord, workspace: string): string {
 		return `<skill_context>\n  <skill_dir>${skill.baseDir}</skill_dir>\n  <workspace_dir>${workspace}</workspace_dir>\n\n  <path_policy>\n    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.\n    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.\n    Use $PI_SKILL_DIR/path for explicit bundled skill files.\n    Use $PI_WORKSPACE/path for explicit workspace/project files.\n  </path_policy>\n</skill_context>`;
@@ -277,6 +411,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			return `[dynamic shell ${status}: ${command}${output ? `\n${output}` : err.message ? `\n${err.message}` : ""}]`;
 		}
 	}
+
+	// ---------------------------------------------------------------------------
+	// Event handlers
+	// ---------------------------------------------------------------------------
 
 	pi.on("session_start", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
@@ -381,11 +519,16 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 		let changed = false;
 		let addedSkillContext = false;
+		let frontmatterFields: { model?: string; thinking?: string } | undefined;
 		const content = await Promise.all(
 			event.content.map(async (block) => {
 				if (block.type !== "text") return block;
 				let text = block.text;
 				if (!addedSkillContext) {
+					// Grab frontmatter fields from the raw text before modifying it
+					if (!frontmatterFields) {
+						frontmatterFields = extractFrontmatterFields(text);
+					}
 					text = insertSkillContext(text, skill, ctx.cwd);
 					addedSkillContext = true;
 					changed = text !== block.text;
@@ -395,7 +538,20 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				return { ...block, text };
 			}),
 		);
+
+		// Apply model/thinking overrides from frontmatter.
+		// Fire-and-forget: takes effect for the next LLM call, not the current in-flight turn.
+		if (frontmatterFields) {
+			void applySkillOverrides(frontmatterFields, ctx);
+		}
+
 		if (changed) return { content };
 	});
 
+	// Restore original model/thinking when the agent finishes processing a user request.
+	// The counter handles sequential skill reads within one agent loop: each valid override
+	// increments; agent_end restores only when the counter drops back to zero.
+	pi.on("agent_end", async (_event, ctx) => {
+		await restoreOriginalState(ctx);
+	});
 }
