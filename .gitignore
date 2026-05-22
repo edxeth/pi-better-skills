@@ -1,2 +1,4 @@
 .pi/
+bun.lock
+node_modules
 

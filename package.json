@@ -1,0 +1,28 @@
+{
+  "name": "pi-better-skills",
+  "version": "1.0.0",
+  "description": "`pi-better-skills` makes Pi skills resolve their bundled files from the skill directory, not from whatever project you are working in.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build index.ts --outdir=."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edxeth/pi-better-skills.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/edxeth/pi-better-skills/issues"
+  },
+  "homepage": "https://github.com/edxeth/pi-better-skills#readme",
+  "dependencies": {
+    "picomatch": "^4.0.4"
+  }
+}

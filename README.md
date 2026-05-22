@@ -196,6 +196,70 @@ model: google/gemini-3.1-pro-preview
 
 If the running session has more tokens than the target model's `contextWindow`, the model switch is skipped. You can't accidentally shrink the window and lose context.
 
+## Auto-injecting skills with `globs`
+
+Skills with a `globs` field in their frontmatter get injected when you read a matching file. You don't need to load the skill manually. The extension watches `read` tool calls, checks each skill's globs against the file path, and prepends matching skill content to the result.
+
+### Frontmatter format
+
+```yaml
+---
+name: react-patterns
+description: React component best practices
+globs: ["**/*.tsx", "**/*.jsx"]
+---
+```
+
+You can also use YAML list format:
+
+```yaml
+---
+name: react-patterns
+description: React component best practices
+globs:
+  - "**/*.tsx"
+  - "**/*.jsx"
+---
+```
+
+Or a single pattern:
+
+```yaml
+---
+name: docker-tips
+description: Dockerfile and compose conventions
+globs: "Dockerfile*"
+---
+```
+
+### Deduplication
+
+Skills inject once per turn, not once per file. If you read three `.tsx` files in one turn, matching skills inject on the first read only.
+
+### Supported glob patterns
+
+| Pattern | Matches | Example match |
+|---------|---------|---------------|
+| `*.tsx` | Files ending in `.tsx` in any directory | `src/Button.tsx` |
+| `**/*.tsx` | `.tsx` files at any depth | `src/components/Button.tsx` |
+| `src/**/*.ts` | `.ts` files under `src/` | `src/utils/parse.ts` |
+| `Dockerfile` | Files named `Dockerfile` anywhere | `project/Dockerfile` |
+| `*.{ts,tsx}` | `.ts` or `.tsx` files | `src/utils.ts`, `src/Button.tsx` |
+| `**/*.css` | `.css` files at any depth | `src/styles.css` |
+| `**/*.test.ts` | Test files at any depth | `src/Button.test.ts` |
+| `docs/**` | Everything under `docs/` | `docs/api/overview.md` |
+| `**/fixtures/**` | Everything under any `fixtures/` dir | `tests/fixtures/data.json` |
+
+Dot files are matched. Bare patterns without a `/` match against the filename, so `*.tsx` works the same as `**/*.tsx`.
+
+### What gets injected
+
+The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block with path resolution hints, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills. They only run when you read the skill directly.
+
+### When globs don't match
+
+The extension is a no-op. Skills without `globs` behave like before.
+
 ## Trust and safety
 
 Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.

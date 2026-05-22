@@ -1,14 +1,16 @@
 import { exec } from "node:child_process";
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { extractGlobs, hasGlobs, matchesGlobs } from "./globs";
 
 type SkillRecord = {
 	name: string;
 	filePath: string;
 	baseDir: string;
+	globs?: string[];
 };
 
 const DYNAMIC_BLOCK_PATTERN = /```!\s*\n?([\s\S]*?)\n?```/g;
@@ -50,7 +52,20 @@ function scanSkillRoots(roots: string[]): SkillRecord[] {
 		}
 
 		if (entries.some((entry) => entry.isFile() && entry.name === "SKILL.md")) {
-			out.push({ name: dir.split(/[\\/]/).pop() || dir, filePath: join(dir, "SKILL.md"), baseDir: dir });
+			const skillPath = join(dir, "SKILL.md");
+			let globs: string[] | undefined;
+			try {
+				const content = readFileSync(skillPath, "utf-8");
+				globs = extractGlobs(content);
+			} catch {
+				// Silently skip unreadable SKILL.md
+			}
+			out.push({
+				name: dir.split(/[\\/]/).pop() || dir,
+				filePath: skillPath,
+				baseDir: dir,
+				globs,
+			});
 			return;
 		}
 
@@ -116,6 +131,8 @@ function extractFrontmatterFields(text: string): { model?: string; thinking?: st
 export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skills = new Map<string, SkillRecord>();
 	let activeSkill: SkillRecord | undefined;
+	// Tracks skills auto-injected via globs in the current turn (deduplication).
+	let injectedThisTurn = new Set<string>();
 
 	// ---------------------------------------------------------------------------
 	// Model/thinking override state
@@ -236,7 +253,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			resolve(cwd, ".pi/skills"),
 		];
 		for (const skill of scanSkillRoots(roots)) {
-			if (!next.has(skill.name)) next.set(skill.name, skill);
+			const existing = next.get(skill.name);
+			if (existing) {
+				// Filesystem skill may have richer data (e.g. globs). Merge globs in.
+				if (skill.globs && !existing.globs) {
+					next.set(skill.name, { ...existing, globs: skill.globs });
+				}
+			} else {
+				next.set(skill.name, skill);
+			}
 		}
 		skills = next;
 	}
@@ -420,6 +445,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		refreshSkills(ctx.cwd);
 	});
 
+	pi.on("turn_start", async () => {
+		injectedThisTurn.clear();
+	});
+
 	pi.on("resources_discover", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
 	});
@@ -503,10 +532,16 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.isError) return;
 
+		// Phase 1: Identify the directly targeted skill (SKILL.md read / bash referencing SKILL.md)
 		let skill: SkillRecord | undefined;
+		let readPath: string | undefined;
+
 		if (event.toolName === "read") {
 			const inputPath = typeof event.input.path === "string" ? event.input.path : undefined;
-			if (inputPath) skill = findSkillForPath(inputPath);
+			if (inputPath) {
+				skill = findSkillForPath(inputPath);
+				readPath = isAbsolute(inputPath) ? inputPath : resolve(ctx.cwd, inputPath);
+			}
 		} else if (event.toolName === "bash") {
 			const command = typeof event.input.command === "string" ? event.input.command : undefined;
 			if (command) skill = findSkillReferencedByCommand(command, ctx.cwd);
@@ -514,24 +549,62 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (!skill) return;
-		activeSkill = skill;
+		// Phase 2: Find skills whose globs match the read path (globs-based auto-injection)
+		const toInject: SkillRecord[] = [];
+		if (event.toolName === "read" && readPath) {
+			const resolvedPath = resolve(readPath);
+			for (const s of skills.values()) {
+				if (!hasGlobs(s)) continue;
+				if (skill && skill.name === s.name) continue;
+				// Per-turn deduplication: don't re-inject skills already loaded this turn
+				if (injectedThisTurn.has(s.name)) continue;
+				if (matchesGlobs(resolvedPath, s.globs!)) {
+					toInject.push(s);
+				}
+			}
+		}
 
+		if (!skill && toInject.length === 0) return;
+		if (skill) activeSkill = skill;
+
+		// Phase 3: Build result content by prepending injected skills
 		let changed = false;
-		let addedSkillContext = false;
 		let frontmatterFields: { model?: string; thinking?: string } | undefined;
+
+		// Start with the original content blocks
+		const allBlocks: any[] = [...event.content];
+
+		// Prepend injected skill content (only for read events with globs matches)
+		for (const injSkill of toInject) {
+			try {
+				const rawContent = readFileSync(injSkill.filePath, "utf-8");
+				const contextInjected = insertSkillContext(rawContent, injSkill, ctx.cwd);
+				// Skip dynamic shell for auto-injected skills — it's a passive injection,
+				// not an explicit skill load. Dynamic shell is a side-effect footgun.
+				allBlocks.unshift({
+					type: "text",
+					text: contextInjected,
+				});
+				injectedThisTurn.add(injSkill.name);
+				changed = true;
+			} catch {
+				// Silently skip unreadable skills
+			}
+		}
+
+		// Phase 4: Process the main content blocks (skill context + dynamic shell)
+		let addedMainContext = false;
 		const content = await Promise.all(
-			event.content.map(async (block) => {
+			allBlocks.map(async (block) => {
 				if (block.type !== "text") return block;
+				// Only process blocks from the original read result, not injected skill blocks
+				if (!skill || !event.content.includes(block)) return block;
 				let text = block.text;
-				if (!addedSkillContext) {
-					// Grab frontmatter fields from the raw text before modifying it
-					if (!frontmatterFields) {
-						frontmatterFields = extractFrontmatterFields(text);
-					}
+				if (!addedMainContext) {
+					const fields = extractFrontmatterFields(text);
+					if (fields.model || fields.thinking) frontmatterFields = fields;
 					text = insertSkillContext(text, skill, ctx.cwd);
-					addedSkillContext = true;
-					changed = text !== block.text;
+					addedMainContext = true;
 				}
 				text = await executeDynamicShell(text, skill, ctx.cwd);
 				if (text !== block.text) changed = true;
@@ -552,6 +625,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// The counter handles sequential skill reads within one agent loop: each valid override
 	// increments; agent_end restores only when the counter drops back to zero.
 	pi.on("agent_end", async (_event, ctx) => {
+		injectedThisTurn.clear();
 		await restoreOriginalState(ctx);
 	});
 }
