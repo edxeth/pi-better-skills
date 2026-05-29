@@ -1,5 +1,14 @@
 # pi-better-skills
 
+## 🌐 **Join the Community**
+
+> [!NOTE]
+> **Building with AI doesn’t have to be a solo grind.**  
+> Join our Discord community to meet other people exploring the latest models, tools, workflows, and ideas: **https://discord.gg/whhrDtCrSS**
+>
+> We talk about what’s new, what’s useful, and what’s actually worth paying attention to in AI.  
+> *And if you want more than conversation,* members also get access to **heavily discounted AI products and services** — including deals on tools like **ChatGPT Plus** and more for just a few dollars.
+
 `pi-better-skills` makes Pi skills resolve their bundled files from the skill directory, not from whatever project you are working in.
 
 Pi implements the [Agent Skills standard](https://agentskills.io): small capability packages with a `SKILL.md`, helper scripts, reference files, templates, and assets. Many skills assume relative paths start at the skill folder. Pi runs tools from your current workspace, so a skill can say:
