@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { extractGlobs, hasGlobs, matchesGlobs } from "./globs";
+import { setupSkillAutocomplete } from "./skill-autocomplete";
 
 type SkillRecord = {
 	name: string;
@@ -39,6 +40,35 @@ function normalizeSkill(raw: unknown): SkillRecord | undefined {
 	const baseDir = typeof obj.baseDir === "string" ? obj.baseDir : filePath ? dirname(filePath) : undefined;
 	if (!name || !filePath || !baseDir) return undefined;
 	return { name, filePath, baseDir };
+}
+
+// ponytail: hand-rolls pi's package cache layout (github.com/<owner>/<repo> ->
+// ~/.pi/agent/git/...). Only github.com git specs resolve; npm and non-github
+// hosts get no pre-prompt discovery (before_agent_start still merges pi's set).
+// Upgrade to an extension API exposing active skill roots when pi provides one.
+function packageRootFromSource(source: string): string | undefined {
+	if (source.startsWith("/") || source.startsWith("~/")) return homePath(source);
+	if (!source.startsWith("git:")) return undefined;
+	let spec = source.slice("git:".length).replace(/\.git$/, "");
+	spec = spec.replace(/^https?:\/\/github\.com\//, "github.com/");
+	if (!spec.startsWith("github.com/")) return undefined;
+	return homePath(`~/.pi/agent/git/${spec}`);
+}
+
+function activePackageRootsFromSettings(): string[] {
+	try {
+		const settings = JSON.parse(readFileSync(homePath("~/.pi/agent/settings.json"), "utf-8")) as { packages?: unknown[] };
+		const roots: string[] = [];
+		for (const entry of settings.packages ?? []) {
+			const source = typeof entry === "string" ? entry : entry && typeof entry === "object" ? (entry as { source?: unknown }).source : undefined;
+			if (typeof source !== "string") continue;
+			const root = packageRootFromSource(source);
+			if (root) roots.push(root);
+		}
+		return roots;
+	} catch {
+		return [];
+	}
 }
 
 function scanSkillRoots(roots: string[]): SkillRecord[] {
@@ -130,6 +160,8 @@ function extractFrontmatterFields(text: string): { model?: string; thinking?: st
 
 export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skills = new Map<string, SkillRecord>();
+	let skillList: SkillRecord[] = [];
+	let cachedPackageRoots: string[] | undefined;
 	let activeSkill: SkillRecord | undefined;
 	// Tracks skills auto-injected via globs in the current turn (deduplication).
 	let injectedThisTurn = new Set<string>();
@@ -252,6 +284,14 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			homePath("~/.agents/skills"),
 			resolve(cwd, ".pi/skills"),
 		];
+		// Active package roots are session-static; parse settings once.
+		if (!cachedPackageRoots) cachedPackageRoots = activePackageRootsFromSettings();
+		// Package skills live under <pkg>/skills/** (or <pkg>/SKILL.md); don't walk the
+		// whole repo tree (src/dist/tests/...) on every turn.
+		for (const root of cachedPackageRoots) {
+			roots.push(join(root, "skills"));
+			if (existsSync(join(root, "SKILL.md"))) roots.push(root);
+		}
 		for (const skill of scanSkillRoots(roots)) {
 			const existing = next.get(skill.name);
 			if (existing) {
@@ -264,6 +304,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			}
 		}
 		skills = next;
+		skillList = Array.from(next.values());
 	}
 
 	function isTrustedForDynamicShell(skill: SkillRecord): boolean {
@@ -443,6 +484,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
+		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => skillList);
 	});
 
 	pi.on("turn_start", async () => {

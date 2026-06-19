@@ -8,13 +8,20 @@
   },
   "scripts": {
     "test": "bun test",
-    "build": "bun build index.ts --outdir=."
+    "build": "bun build index.ts --target=node --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --outdir=."
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/edxeth/pi-better-skills.git"
   },
-  "keywords": [],
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "author": "",
   "license": "ISC",
   "type": "commonjs",
@@ -24,5 +31,9 @@
   "homepage": "https://github.com/edxeth/pi-better-skills#readme",
   "dependencies": {
     "picomatch": "^4.0.4"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   }
 }
