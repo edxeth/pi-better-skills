@@ -9,7 +9,6 @@ import {
 	type TUI,
 	CURSOR_MARKER,
 	fuzzyFilter,
-	getKeybindings,
 } from "@earendil-works/pi-tui";
 
 export type SkillAutocompleteSkill = {
@@ -88,6 +87,10 @@ function skillAutocompleteItem(skill: SkillAutocompleteSkill): AutocompleteItem 
 	};
 }
 
+function isSkillItem(item: AutocompleteItem): boolean {
+	return typeof item.value === "string" && item.value.startsWith("skill:");
+}
+
 function restorePrivateEditorCursor(editor: CustomEditor, cursorLine: number, cursorCol: number): void {
 	// ponytail: pi's Editor has no public setCursor(line, col) yet; poke the
 	// private state field. Upgrade to the public setter when pi-tui adds one.
@@ -142,10 +145,13 @@ class SkillGhostEditor extends CustomEditor {
 		return result;
 	}
 
+	private get kb(): KeybindingsManager {
+		return (this as unknown as { keybindings: KeybindingsManager }).keybindings;
+	}
+
 	handleInput(data: string): void {
-		const kb = getKeybindings();
 		if (
-			(kb.matches(data, "tui.input.tab") || kb.matches(data, "tui.editor.cursorRight")) &&
+			(this.kb.matches(data, "tui.input.tab") || this.kb.matches(data, "tui.editor.cursorRight")) &&
 			!this.isShowingAutocomplete()
 		) {
 			const hit = this.currentHit();
@@ -178,6 +184,9 @@ export function setupSkillAutocomplete(ctx: ExtensionContext, getSkills: () => S
 			return { items, prefix: hit.prefix };
 		},
 		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			// Only custom-insert our own skill items; delegate everything else
+			// (built-in slash/file/path completions) to the wrapped provider.
+			if (!isSkillItem(item)) return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
 			const currentLine = lines[cursorLine] ?? "";
 			const token = slashTokenAtCursor(currentLine, cursorCol);
 			const start = token?.start ?? cursorCol - prefix.length;
@@ -192,6 +201,11 @@ export function setupSkillAutocomplete(ctx: ExtensionContext, getSkills: () => S
 		},
 	}));
 
+	if (ctx.ui.getEditorComponent?.()) {
+		// Another extension already replaced the editor (vim/modal/accessibility).
+		// Don't clobber it; the popup provider above still covers mid-text completion.
+		return;
+	}
 	ctx.ui.setEditorComponent(
 		(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager): EditorComponent =>
 			new SkillGhostEditor(tui, theme, keybindings, getSkills),

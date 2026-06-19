@@ -42,10 +42,13 @@ function normalizeSkill(raw: unknown): SkillRecord | undefined {
 	return { name, filePath, baseDir };
 }
 
-// ponytail: hand-rolls pi's package cache layout (github.com/<owner>/<repo> ->
-// ~/.pi/agent/git/...). Only github.com git specs resolve; npm and non-github
-// hosts get no pre-prompt discovery (before_agent_start still merges pi's set).
-// Upgrade to an extension API exposing active skill roots when pi provides one.
+// ponytail: hand-rolls pi's package cache layout. Only `git:github.com/...`
+// specs resolve to ~/.pi/agent/git/...; it does NOT cover npm specs, SSH/https
+// git URLs, branch refs (git:...@ref), project-local .pi/settings.json, or
+// per-package `skills: []` filters. before_agent_start still merges pi's
+// authoritative loaded set at runtime, so affected skills merely lack
+// pre-prompt discovery (never resolution). Upgrade to an extension API
+// exposing active skill roots when pi provides one.
 function packageRootFromSource(source: string): string | undefined {
 	if (source.startsWith("/") || source.startsWith("~/")) return homePath(source);
 	if (!source.startsWith("git:")) return undefined;
