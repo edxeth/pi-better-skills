@@ -1,6 +1,6 @@
 {
   "name": "pi-better-skills",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "`pi-better-skills` makes Pi skills resolve their bundled files from the skill directory, not from whatever project you are working in.",
   "main": "index.js",
   "directories": {
