@@ -33,12 +33,15 @@ type SkillAutocompleteHit = {
 	ci: number;
 };
 
-function slashTokenAtCursor(line: string, col: number): SlashToken | undefined {
+function slashTokenAtCursor(line: string, col: number, allowLineStart = false): SlashToken | undefined {
 	const slashIndex = line.lastIndexOf("/", col - 1);
 	if (slashIndex === -1) return undefined;
 	const beforeSlash = line.slice(0, slashIndex);
 	if (beforeSlash.length > 0 && !/\s$/.test(beforeSlash)) return undefined;
-	if (beforeSlash.trim() === "") return undefined;
+	// A bare `/skill:` at the start of a line: on line 0 pi's built-in slash menu
+	// owns it, so bail (defer). On later lines there is no built-in menu
+	// (pi-tui gates it to cursorLine === 0), so allow completion there.
+	if (beforeSlash.trim() === "" && !(allowLineStart && slashIndex === 0)) return undefined;
 	const token = line.slice(slashIndex).match(/^\/\S*/)?.[0];
 	if (!token) return undefined;
 	const end = slashIndex + token.length;
@@ -60,7 +63,7 @@ function computeSkillAutocompleteHit(
 ): SkillAutocompleteHit | null {
 	const line = lines[ci] ?? "";
 	if (col !== line.length) return null;
-	const hit = slashTokenAtCursor(line, col);
+	const hit = slashTokenAtCursor(line, col, ci !== 0);
 	if (!hit || hit.query.length === 0 || hit.end !== line.length) return null;
 	const query = hit.query.toLowerCase();
 	let best: SkillAutocompleteSkill | undefined;
@@ -108,6 +111,13 @@ class SkillGhostEditor extends CustomEditor {
 		private readonly getSkills: () => SkillAutocompleteSkill[],
 	) {
 		super(tui, theme, keybindings);
+
+		// ponytail: pi-tui's Editor gates slash autocomplete to `cursorLine === 0`
+		// (private `isSlashMenuAllowed`). That leaves later lines with no popup at all.
+		// Override it so the skill popup (and the built-in slash menu) can trigger on any
+		// line. The method is private in the type, so poke it through the same isolated
+		// cast used for cursor state below. Upgrade to a public hook when pi-tui adds one.
+		(this as unknown as { isSlashMenuAllowed: () => boolean }).isSlashMenuAllowed = () => true;
 	}
 
 	private currentHit(): SkillAutocompleteHit | null {
@@ -161,6 +171,17 @@ class SkillGhostEditor extends CustomEditor {
 			}
 		}
 		super.handleInput(data);
+
+		// pi-tui only auto-triggers slash completion when `/` starts the current
+		// line, so a `/skill:` that follows other text on a line never opens the
+		// popup. If there's a skill token at the cursor and no popup is up yet, ask
+		// pi-tui to trigger; our provider will supply (or decline) skill items.
+		if (!this.isShowingAutocomplete()) {
+			const { line, col } = this.getCursor();
+			if (slashTokenAtCursor(this.getLines()[line] ?? "", col, line !== 0)) {
+				(this as unknown as { tryTriggerAutocomplete: () => void }).tryTriggerAutocomplete();
+			}
+		}
 	}
 
 	private acceptHit(hit: SkillAutocompleteHit): void {
@@ -177,7 +198,7 @@ export function setupSkillAutocomplete(ctx: ExtensionContext, getSkills: () => S
 	ctx.ui.addAutocompleteProvider((current): AutocompleteProvider => ({
 		async getSuggestions(lines, cursorLine, cursorCol, options): Promise<AutocompleteSuggestions | null> {
 			const currentLine = lines[cursorLine] ?? "";
-			const hit = slashTokenAtCursor(currentLine, cursorCol);
+			const hit = slashTokenAtCursor(currentLine, cursorCol, cursorLine !== 0);
 			if (!hit) return current.getSuggestions(lines, cursorLine, cursorCol, options);
 			const items = fuzzyFilter(getSkills(), hit.query, (skill) => skill.name).map(skillAutocompleteItem);
 			if (items.length === 0) return current.getSuggestions(lines, cursorLine, cursorCol, options);
@@ -188,7 +209,7 @@ export function setupSkillAutocomplete(ctx: ExtensionContext, getSkills: () => S
 			// (built-in slash/file/path completions) to the wrapped provider.
 			if (!isSkillItem(item)) return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
 			const currentLine = lines[cursorLine] ?? "";
-			const token = slashTokenAtCursor(currentLine, cursorCol);
+			const token = slashTokenAtCursor(currentLine, cursorCol, cursorLine !== 0);
 			const start = token?.start ?? cursorCol - prefix.length;
 			const end = token?.end ?? cursorCol;
 			const insertion = `/${item.value} `;
