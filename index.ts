@@ -4,7 +4,9 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { extractGlobs, hasGlobs, matchesGlobs } from "./globs";
+import { setupSkillAutocomplete } from "./skill-autocomplete";
 
 type SkillRecord = {
 	name: string;
@@ -39,6 +41,120 @@ function normalizeSkill(raw: unknown): SkillRecord | undefined {
 	const baseDir = typeof obj.baseDir === "string" ? obj.baseDir : filePath ? dirname(filePath) : undefined;
 	if (!name || !filePath || !baseDir) return undefined;
 	return { name, filePath, baseDir };
+}
+
+// ponytail: hand-rolls pi's package cache layout. Only `git:github.com/...`
+// specs resolve to ~/.pi/agent/git/...; it does NOT cover npm specs, SSH/https
+// git URLs, branch refs (git:...@ref), project-local .pi/settings.json, or
+// per-package `skills: []` filters. before_agent_start still merges pi's
+// authoritative loaded set at runtime, so affected skills merely lack
+// pre-prompt discovery (never resolution). Upgrade to an extension API
+// exposing active skill roots when pi provides one.
+function packageRootFromSource(source: string): string | undefined {
+	if (source.startsWith("/") || source.startsWith("~/")) return homePath(source);
+	if (!source.startsWith("git:")) return undefined;
+	let spec = source.slice("git:".length).replace(/\.git$/, "");
+	spec = spec.replace(/^https?:\/\/github\.com\//, "github.com/");
+	if (!spec.startsWith("github.com/")) return undefined;
+	return homePath(`~/.pi/agent/git/${spec}`);
+}
+
+function activePackageRootsFromSettings(): string[] {
+	try {
+		const settings = JSON.parse(readFileSync(homePath("~/.pi/agent/settings.json"), "utf-8")) as { packages?: unknown[] };
+		const roots: string[] = [];
+		for (const entry of settings.packages ?? []) {
+			const source = typeof entry === "string" ? entry : entry && typeof entry === "object" ? (entry as { source?: unknown }).source : undefined;
+			if (typeof source !== "string") continue;
+			const root = packageRootFromSource(source);
+			if (root) roots.push(root);
+		}
+		return roots;
+	} catch {
+		return [];
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multi-skill invocation
+// ---------------------------------------------------------------------------
+// pi core only expands a *single* leading `/skill:<name>` per message
+// (`AgentSession._expandSkillCommand`); any additional `/skill:<name>` tokens
+// are passed through as literal text. This helper lets a message reference
+// multiple skills: the leading token is left untouched for pi core, and every
+// *additional* resolvable token is replaced in place with the same `<skill>`
+// XML block core itself produces. Replacement is in place (not appended) so the
+// user's text ordering is preserved, and the leading `/skill:` stays at index 0
+// so core keeps owning the leading skill.
+
+export type InlineSkillRef = {
+	name: string;
+	filePath: string;
+	baseDir: string;
+};
+
+const INLINE_SKILL_TOKEN = /\/skill:([A-Za-z0-9._-]+)/g;
+
+/**
+ * Replace non-leading `/skill:<name>` tokens in place with `<skill>` XML blocks.
+ *
+ * Returns the rewritten text plus the names of injected skills, or `undefined`
+ * when there is nothing to inject (so callers can leave the message untouched).
+ * The leading token (at index 0) is always skipped — pi core handles it.
+ * Unknown or unreadable skills are left verbatim so core/pi can report them.
+ *
+ * `decorate`, if provided, wraps the skill body (e.g. with `<skill_context>`);
+ * it receives the body and must return the inner content of the `<skill>` block.
+ */
+export function expandInlineSkills(
+	text: string,
+	resolve: (name: string) => InlineSkillRef | undefined,
+	readBody: (skill: InlineSkillRef) => string,
+	decorate?: (body: string, skill: InlineSkillRef) => string,
+): { text: string; injected: string[] } | undefined {
+	if (!text.includes("/skill:")) return undefined;
+
+	const matches = [...text.matchAll(INLINE_SKILL_TOKEN)].filter((match) => {
+		const start = match.index ?? 0;
+		return start === 0 || /\s/.test(text[start - 1] ?? "");
+	});
+	if (matches.length === 0) return undefined;
+
+	type Replacement = { start: number; end: number; block: string };
+	const replacements: Replacement[] = [];
+	const injected: string[] = [];
+
+	for (const match of matches) {
+		const start = match.index ?? 0;
+		if (start === 0) continue; // leading skill -> pi core expands it
+		const skill = resolve(match[1] ?? "");
+		if (!skill) continue; // unknown skill: leave token verbatim
+
+		let body: string;
+		try {
+			body = readBody(skill);
+		} catch {
+			continue; // unreadable SKILL.md: leave token verbatim
+		}
+
+		const inner = decorate ? decorate(body, skill) : body;
+		const block = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${inner}\n</skill>`;
+		replacements.push({ start, end: start + match[0].length, block });
+		injected.push(skill.name);
+	}
+
+	if (replacements.length === 0) return undefined;
+
+	replacements.sort((a, b) => a.start - b.start);
+	let out = "";
+	let cursor = 0;
+	for (const { start, end, block } of replacements) {
+		out += text.slice(cursor, start) + block;
+		cursor = end;
+	}
+	out += text.slice(cursor);
+
+	return { text: out, injected };
 }
 
 function scanSkillRoots(roots: string[]): SkillRecord[] {
@@ -130,6 +246,8 @@ function extractFrontmatterFields(text: string): { model?: string; thinking?: st
 
 export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skills = new Map<string, SkillRecord>();
+	let skillList: SkillRecord[] = [];
+	let cachedPackageRoots: string[] | undefined;
 	let activeSkill: SkillRecord | undefined;
 	// Tracks skills auto-injected via globs in the current turn (deduplication).
 	let injectedThisTurn = new Set<string>();
@@ -252,6 +370,14 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			homePath("~/.agents/skills"),
 			resolve(cwd, ".pi/skills"),
 		];
+		// Active package roots are session-static; parse settings once.
+		if (!cachedPackageRoots) cachedPackageRoots = activePackageRootsFromSettings();
+		// Package skills live under <pkg>/skills/** (or <pkg>/SKILL.md); don't walk the
+		// whole repo tree (src/dist/tests/...) on every turn.
+		for (const root of cachedPackageRoots) {
+			roots.push(join(root, "skills"));
+			if (existsSync(join(root, "SKILL.md"))) roots.push(root);
+		}
 		for (const skill of scanSkillRoots(roots)) {
 			const existing = next.get(skill.name);
 			if (existing) {
@@ -264,6 +390,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			}
 		}
 		skills = next;
+		skillList = Array.from(next.values());
 	}
 
 	function isTrustedForDynamicShell(skill: SkillRecord): boolean {
@@ -443,6 +570,25 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
+		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => skillList);
+	});
+
+	// Expand additional `/skill:<name>` references beyond the leading one pi core
+	// already handles. Runs before core's skill expansion; transform is a no-op
+	// (returns continue) when there are no extra resolvable tokens.
+	pi.on("input", async (event, ctx) => {
+		if (event.source === "extension") return; // don't rewrite extension-injected text
+		const result = expandInlineSkills(
+			event.text,
+			(name) => skills.get(name),
+			(skill) => stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim(),
+			// Wrap the body with the same <skill_context> block the extension injects
+			// when a SKILL.md is read, so relative-path resolution applies to these
+			// multi-skill invocations too (core's own leading-skill block lacks it).
+			(body, skill) => insertSkillContext(body, skill, ctx.cwd),
+		);
+		if (!result) return;
+		return { action: "transform" as const, text: result.text };
 	});
 
 	pi.on("turn_start", async () => {
