@@ -21,6 +21,18 @@ and the agent may try `./scripts/search.sh` in your project instead of the skill
 
 This extension gives the model the missing path context.
 
+## Install
+
+```bash
+pi install git:github.com/edxeth/pi-better-skills
+```
+
+New sessions load it automatically. Existing sessions need:
+
+```text
+/reload
+```
+
 ## What it solves
 
 ### Skills can bundle real tools
@@ -289,16 +301,4 @@ export PI_TRUST_PROJECT_SKILL_SHELL=1
 ```
 
 Only do this in repositories you trust.
-
-## Install
-
-```bash
-pi install git:github.com/edxeth/pi-better-skills
-```
-
-New sessions load it automatically. Existing sessions need:
-
-```text
-/reload
-```
 
