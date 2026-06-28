@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { SkillInvocationMessageComponent, stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { Container, Spacer } from "@earendil-works/pi-tui";
 import {
 	extractDisableModelInvocation,
 	extractGlobs,
@@ -104,13 +105,10 @@ function activePackageRootsFromSettings(): string[] {
 // Multi-skill invocation
 // ---------------------------------------------------------------------------
 // pi core only expands a *single* leading `/skill:<name>` per message
-// (`AgentSession._expandSkillCommand`); any additional `/skill:<name>` tokens
-// are passed through as literal text. This helper lets a message reference
-// multiple skills: the leading token is left untouched for pi core, and every
-// *additional* resolvable token is replaced in place with the same `<skill>`
-// XML block core itself produces. Replacement is in place (not appended) so the
-// user's text ordering is preserved, and the leading `/skill:` stays at index 0
-// so core keeps owning the leading skill.
+// (`AgentSession._expandSkillCommand`). For messages that mention multiple
+// resolvable skills, the extension handles the whole prompt: it appends visible
+// `[skill]` custom messages first, then sends the cleaned user prompt. That
+// keeps TUI ordering and LLM context ordering aligned without touching pi core.
 
 export type InlineSkillRef = {
 	name: string;
@@ -118,25 +116,87 @@ export type InlineSkillRef = {
 	baseDir: string;
 };
 
+export type InlineSkillDisplay = InlineSkillRef & {
+	content: string;
+	block: string;
+};
+
+type InlineSkillBatchDetails = {
+	skills: InlineSkillDisplay[];
+};
+
 const INLINE_SKILL_TOKEN = /\/skill:([A-Za-z0-9._-]+)/g;
 
+function formatInlineSkillDisplay(skill: InlineSkillRef, inner: string): InlineSkillDisplay {
+	const content = `References are relative to ${skill.baseDir}.\n\n${inner}`;
+	return {
+		...skill,
+		content,
+		block: `<skill name="${skill.name}" location="${skill.filePath}">\n${content}\n</skill>`,
+	};
+}
+
+function renderInlineSkillDisplay(skill: InlineSkillDisplay, expanded: boolean): SkillInvocationMessageComponent {
+	const component = new SkillInvocationMessageComponent({
+		name: skill.name,
+		location: skill.filePath,
+		content: skill.content,
+	});
+	component.setExpanded(expanded);
+	return component;
+}
+
+function renderInlineSkillBatch(message: { details?: unknown }, options: { expanded: boolean }) {
+	const details = message.details as InlineSkillBatchDetails | undefined;
+	if (!details?.skills?.length) return undefined;
+	if (details.skills.length === 1) return renderInlineSkillDisplay(details.skills[0], options.expanded);
+
+	const container = new Container();
+	details.skills.forEach((skill, index) => {
+		if (index > 0) container.addChild(new Spacer(1));
+		container.addChild(renderInlineSkillDisplay(skill, options.expanded));
+	});
+	return container;
+}
+
+function inlineSkillMessage(skill: InlineSkillDisplay): {
+	customType: "skill";
+	content: string;
+	display: true;
+	details: InlineSkillBatchDetails;
+} {
+	return {
+		customType: "skill",
+		content: skill.block,
+		display: true,
+		details: { skills: [skill] },
+	};
+}
+
+function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDisplay[]): boolean {
+	if (skills.length !== 1) return false;
+	const token = `/skill:${skills[0].name}`;
+	const trimmed = text.trimStart();
+	return trimmed === token || (trimmed.startsWith(token) && /\s/.test(trimmed[token.length] ?? ""));
+}
+
 /**
- * Replace non-leading `/skill:<name>` tokens in place with `<skill>` XML blocks.
- *
- * Returns the rewritten text plus the names of injected skills, or `undefined`
- * when there is nothing to inject (so callers can leave the message untouched).
- * The leading token (at index 0) is always skipped — pi core handles it.
+ * Remove resolvable `/skill:<name>` tokens from user text and return them as
+ * separate skill-display records. By default the leading token is skipped so pi
+ * core can keep handling ordinary single-skill commands. Pass
+ * `includeLeading: true` when the extension owns the whole multi-skill prompt.
  * Unknown or unreadable skills are left verbatim so core/pi can report them.
  *
  * `decorate`, if provided, wraps the skill body (e.g. with `<skill_context>`);
  * it receives the body and must return the inner content of the `<skill>` block.
  */
-export function expandInlineSkills(
+export function extractInlineSkillDisplays(
 	text: string,
 	resolve: (name: string) => InlineSkillRef | undefined,
 	readBody: (skill: InlineSkillRef) => string,
 	decorate?: (body: string, skill: InlineSkillRef) => string,
-): { text: string; injected: string[] } | undefined {
+	options?: { includeLeading?: boolean },
+): { text: string; skills: InlineSkillDisplay[] } | undefined {
 	if (!text.includes("/skill:")) return undefined;
 
 	const matches = [...text.matchAll(INLINE_SKILL_TOKEN)].filter((match) => {
@@ -145,13 +205,13 @@ export function expandInlineSkills(
 	});
 	if (matches.length === 0) return undefined;
 
-	type Replacement = { start: number; end: number; block: string };
-	const replacements: Replacement[] = [];
-	const injected: string[] = [];
+	type Removal = { start: number; end: number };
+	const removals: Removal[] = [];
+	const skills: InlineSkillDisplay[] = [];
 
 	for (const match of matches) {
 		const start = match.index ?? 0;
-		if (start === 0) continue; // leading skill -> pi core expands it
+		if (start === 0 && !options?.includeLeading) continue; // leading skill -> pi core expands ordinary single-skill prompts
 		const skill = resolve(match[1] ?? "");
 		if (!skill) continue; // unknown skill: leave token verbatim
 
@@ -163,23 +223,22 @@ export function expandInlineSkills(
 		}
 
 		const inner = decorate ? decorate(body, skill) : body;
-		const block = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${inner}\n</skill>`;
-		replacements.push({ start, end: start + match[0].length, block });
-		injected.push(skill.name);
+		skills.push(formatInlineSkillDisplay(skill, inner));
+		removals.push({ start, end: start + match[0].length });
 	}
 
-	if (replacements.length === 0) return undefined;
+	if (removals.length === 0) return undefined;
 
-	replacements.sort((a, b) => a.start - b.start);
+	removals.sort((a, b) => a.start - b.start);
 	let out = "";
 	let cursor = 0;
-	for (const { start, end, block } of replacements) {
-		out += text.slice(cursor, start) + block;
+	for (const { start, end } of removals) {
+		out += text.slice(cursor, start);
 		cursor = end;
 	}
 	out += text.slice(cursor);
 
-	return { text: out, injected };
+	return { text: out.trim(), skills };
 }
 
 function scanSkillRoots(roots: string[]): SkillRecord[] {
@@ -600,17 +659,19 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// Event handlers
 	// ---------------------------------------------------------------------------
 
+	pi.registerMessageRenderer("skill", renderInlineSkillBatch as any);
+
 	pi.on("session_start", async (_event, ctx) => {
 		refreshSkills(ctx.cwd);
 		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => skillList);
 	});
 
-	// Expand additional `/skill:<name>` references beyond the leading one pi core
-	// already handles. Runs before core's skill expansion; transform is a no-op
-	// (returns continue) when there are no extra resolvable tokens.
+	// Multi-skill prompts are handled entirely by the extension so both the TUI
+	// and the LLM see: skill rows first, cleaned user prompt second. Ordinary
+	// single leading `/skill:name` commands still fall through to pi core.
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return; // don't rewrite extension-injected text
-		const result = expandInlineSkills(
+		const result = extractInlineSkillDisplays(
 			event.text,
 			(name) => skills.get(name),
 			(skill) => stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim(),
@@ -618,8 +679,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			// when a SKILL.md is read, so relative-path resolution applies to these
 			// multi-skill invocations too (core's own leading-skill block lacks it).
 			(body, skill) => insertSkillContext(body, skill, ctx.cwd),
+			{ includeLeading: true },
 		);
-		if (!result) return;
+		if (!result || isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) return;
+
+		const deliverAs = event.streamingBehavior;
+		for (const skill of result.skills) {
+			pi.sendMessage(inlineSkillMessage(skill), { deliverAs });
+		}
+
 		return { action: "transform" as const, text: result.text };
 	});
 
@@ -634,6 +702,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
 		refreshSkills(ctx.cwd, loaded);
+
 		return {
 			systemPrompt:
 				event.systemPrompt +

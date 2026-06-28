@@ -1,13 +1,12 @@
 import { describe, it, expect } from "bun:test";
-import { expandInlineSkills, type InlineSkillRef } from "../index";
+import { extractInlineSkillDisplays, type InlineSkillRef } from "../index";
 
 /**
- * `expandInlineSkills` lets one message reference multiple skills: the leading
+ * `extractInlineSkillDisplays` lets one message reference multiple skills without
+ * stuffing extra skill bodies into the visible user text. The leading
  * `/skill:<name>` is left for pi core, and every additional resolvable token is
- * replaced *in place* with a `<skill>` XML block (the same shape core emits).
- * In-place replacement preserves the user's text ordering and keeps the leading
- * `/skill:` at index 0 so core still owns the leading skill. These tests pin
- * that contract with a fake resolver and body reader (no filesystem).
+ * removed from the prompt and returned as a separate skill-display record that
+ * the extension renders as `[skill] <name>`.
  */
 
 function ref(name: string): InlineSkillRef {
@@ -17,111 +16,121 @@ function ref(name: string): InlineSkillRef {
 function harness(skills: string[], bodies: Record<string, string> = {}) {
 	const known = new Set(skills);
 	return (text: string) =>
-		expandInlineSkills(
+		extractInlineSkillDisplays(
 			text,
 			(name) => (known.has(name) ? ref(name) : undefined),
 			(skill) => bodies[skill.name] ?? `# ${skill.name}`,
 		);
 }
 
-describe("expandInlineSkills leading skill", () => {
+describe("extractInlineSkillDisplays leading skill", () => {
 	it("is a no-op when only a single leading skill is referenced (core owns it)", () => {
-		const expand = harness(["code-simplifier"]);
-		expect(expand("/skill:code-simplifier do stuff")).toBeUndefined();
+		const extract = harness(["code-simplifier"]);
+		expect(extract("/skill:code-simplifier do stuff")).toBeUndefined();
 	});
 
 	it("is a no-op when there are no skill tokens at all", () => {
-		const expand = harness(["code-simplifier"]);
-		expect(expand("just a normal message")).toBeUndefined();
+		const extract = harness(["code-simplifier"]);
+		expect(extract("just a normal message")).toBeUndefined();
 	});
 });
 
-describe("expandInlineSkills in-place replacement + ordering", () => {
-	it("replaces a non-leading token in place and keeps the leading skill for core", () => {
-		const expand = harness(["code-simplifier", "write-a-skill"], {
-			"write-a-skill": "Write skills well.",
-		});
-		const result = expand("/skill:code-simplifier /skill:write-a-skill hi");
-
-		expect(result).not.toBeUndefined();
-		expect(result!.text.startsWith("/skill:code-simplifier")).toBe(true); // leading preserved
-		expect(result!.text).not.toContain("/skill:write-a-skill"); // token replaced
-		expect(result!.text).toContain("hi"); // trailing text preserved
-		expect(result!.text).toContain(
-			'<skill name="write-a-skill" location="/skills/write-a-skill/SKILL.md">\nReferences are relative to /skills/write-a-skill.\n\nWrite skills well.\n</skill>',
+describe("extractInlineSkillDisplays visible prompt cleanup", () => {
+	it("can extract the leading skill when the extension owns a multi-skill prompt", () => {
+		const extract = harness(["torpathy", "ask-matt"]);
+		const result = extractInlineSkillDisplays(
+			"/skill:torpathy what's the best architecture? /skill:ask-matt",
+			(name) => (["torpathy", "ask-matt"].includes(name) ? ref(name) : undefined),
+			(skill) => `# ${skill.name}`,
+			undefined,
+			{ includeLeading: true },
 		);
-		expect(result!.injected).toEqual(["write-a-skill"]);
+
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["torpathy", "ask-matt"]);
+		expect(result!.text).toBe("what's the best architecture?");
 	});
 
-	it("preserves text ordering: trailing text stays AFTER an injected skill block", () => {
-		// Regression for the append-strategy bug that relocated trailing text.
-		const expand = harness(["how-to-code", "tdd"]);
-		const result = expand("/skill:how-to-code I need you to say `hi` /skill:tdd and nothing else");
+	it("removes a non-leading token and keeps the leading skill for core by default", () => {
+		const extract = harness(["code-simplifier", "write-a-skill"], {
+			"write-a-skill": "Write skills well.",
+		});
+		const result = extract("/skill:code-simplifier /skill:write-a-skill hi");
 
-		const tddBlock = result!.text.indexOf('<skill name="tdd"');
-		const trailing = result!.text.indexOf("and nothing else");
-		expect(tddBlock).toBeGreaterThan(-1);
-		expect(trailing).toBeGreaterThan(tddBlock); // trailing text comes AFTER the block
+		expect(result).not.toBeUndefined();
+		expect(result!.text.startsWith("/skill:code-simplifier")).toBe(true);
+		expect(result!.text).not.toContain("/skill:write-a-skill");
+		expect(result!.text).toContain("hi");
+		expect(result!.text).not.toContain("Write skills well.");
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["write-a-skill"]);
+		expect(result!.skills[0].block).toBe(
+			'<skill name="write-a-skill" location="/skills/write-a-skill/SKILL.md">\nReferences are relative to /skills/write-a-skill.\n\nWrite skills well.\n</skill>',
+		);
+	});
+
+	it("keeps trailing user text in the user prompt instead of moving it into a skill block", () => {
+		const extract = harness(["how-to-code", "tdd"]);
+		const result = extract("/skill:how-to-code I need you to say `hi` /skill:tdd and nothing else");
+
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["tdd"]);
 		expect(result!.text).toContain("I need you to say `hi`");
+		expect(result!.text).toContain("and nothing else");
+		expect(result!.text).not.toContain('<skill name="tdd"');
 		expect(result!.text.startsWith("/skill:how-to-code ")).toBe(true);
 	});
 
-	it("injects multiple additional skills in mention order, preserving interleaved text", () => {
-		const expand = harness(["a", "b", "c"]);
-		const result = expand("/skill:a /skill:b text /skill:c");
+	it("extracts multiple additional skills in mention order", () => {
+		const extract = harness(["a", "b", "c"]);
+		const result = extract("/skill:a /skill:b text /skill:c");
 
-		expect(result!.injected).toEqual(["b", "c"]);
-		const bBlock = result!.text.indexOf('<skill name="b"');
-		const textWord = result!.text.indexOf("text");
-		const cBlock = result!.text.indexOf('<skill name="c"');
-		expect(bBlock).toBeGreaterThan(-1);
-		expect(textWord).toBeGreaterThan(bBlock); // 'text' after b block
-		expect(cBlock).toBeGreaterThan(textWord); // c block after 'text'
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["b", "c"]);
 		expect(result!.text.startsWith("/skill:a ")).toBe(true);
+		expect(result!.text).toContain("text");
+		expect(result!.text).not.toContain("/skill:b");
+		expect(result!.text).not.toContain("/skill:c");
 	});
 
-	it("expands all tokens when the message does not start with /skill: (core expands nothing)", () => {
-		const expand = harness(["a", "b"]);
-		const result = expand("hello /skill:a and /skill:b");
+	it("extracts all tokens when the message does not start with /skill: (core expands nothing)", () => {
+		const extract = harness(["a", "b"]);
+		const result = extract("hello /skill:a and /skill:b");
 
-		expect(result!.injected).toEqual(["a", "b"]);
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["a", "b"]);
 		expect(result!.text.startsWith("hello")).toBe(true);
 		expect(result!.text).not.toContain("/skill:");
 	});
 });
 
-describe("expandInlineSkills decoration (<skill_context>)", () => {
-	it("passes the body through decorate and uses its result as the block inner content", () => {
+describe("extractInlineSkillDisplays decoration (<skill_context>)", () => {
+	it("passes the body through decorate before building the skill display block", () => {
 		const known = new Set(["tdd"]);
-		const result = expandInlineSkills(
+		const result = extractInlineSkillDisplays(
 			"/skill:how-to-code /skill:tdd hi",
 			(name) => (known.has(name) ? ref(name) : undefined),
 			() => "BODY",
 			(body) => `<skill_context>CTX</skill_context>\n\n${body}`,
 		);
-		expect(result!.text).toContain(
+		expect(result!.skills[0].block).toContain(
 			'<skill name="tdd" location="/skills/tdd/SKILL.md">\nReferences are relative to /skills/tdd.\n\n<skill_context>CTX</skill_context>\n\nBODY\n</skill>',
 		);
 	});
 
 	it("omits decoration when no decorate callback is supplied", () => {
-		const expand = harness(["tdd"], { tdd: "BODY" });
-		const result = expand("/skill:lead /skill:tdd hi");
-		expect(result!.text).not.toContain("<skill_context>");
-		expect(result!.text).toContain("\n\nBODY\n</skill>");
+		const extract = harness(["tdd"], { tdd: "BODY" });
+		const result = extract("/skill:lead /skill:tdd hi");
+		expect(result!.skills[0].block).not.toContain("<skill_context>");
+		expect(result!.skills[0].block).toContain("\n\nBODY\n</skill>");
 	});
 });
 
-describe("expandInlineSkills unknown / unreadable skills", () => {
-	it("leaves unknown skill tokens verbatim and injects nothing", () => {
-		const expand = harness(["known"]);
-		const result = expand("hi /skill:unknown");
+describe("extractInlineSkillDisplays unknown / unreadable skills", () => {
+	it("leaves unknown skill tokens verbatim and extracts nothing", () => {
+		const extract = harness(["known"]);
+		const result = extract("hi /skill:unknown");
 		expect(result).toBeUndefined();
 	});
 
 	it("leaves a token whose body read throws verbatim", () => {
 		const known = new Set(["good", "bad", "broken"]);
-		const result = expandInlineSkills(
+		const result = extractInlineSkillDisplays(
 			"/skill:good /skill:bad /skill:broken hi",
 			(name) => (known.has(name) ? ref(name) : undefined),
 			(skill) => {
@@ -130,19 +139,19 @@ describe("expandInlineSkills unknown / unreadable skills", () => {
 			},
 		);
 		expect(result).not.toBeUndefined();
-		expect(result!.injected).toEqual(["bad"]); // good is leading (skipped), broken threw
-		expect(result!.text).toContain("/skill:broken"); // verbatim
-		expect(result!.text).not.toContain("/skill:bad"); // replaced
-		expect(result!.text.startsWith("/skill:good")).toBe(true); // leading preserved
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["bad"]);
+		expect(result!.text).toContain("/skill:broken");
+		expect(result!.text).not.toContain("/skill:bad");
+		expect(result!.text.startsWith("/skill:good")).toBe(true);
 	});
 });
 
-describe("expandInlineSkills token boundaries", () => {
+describe("extractInlineSkillDisplays token boundaries", () => {
 	it("does not match /skill: embedded in a path or URL", () => {
-		const expand = harness(["x"]);
-		const result = expand("see foo/skill:x and /skill:x real");
+		const extract = harness(["x"]);
+		const result = extract("see foo/skill:x and /skill:x real");
 		expect(result).not.toBeUndefined();
-		expect(result!.text).toContain("foo/skill:x"); // embedded left as-is
-		expect(result!.text).not.toContain("/skill:x real"); // boundary token replaced
+		expect(result!.text).toContain("foo/skill:x");
+		expect(result!.text).not.toContain("/skill:x real");
 	});
 });
