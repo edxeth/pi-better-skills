@@ -5,7 +5,12 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripFrontmatter } from "@earendil-works/pi-coding-agent";
-import { extractGlobs, hasGlobs, matchesGlobs } from "./globs";
+import {
+	extractDisableModelInvocation,
+	extractGlobs,
+	hasAutoInjectableGlobs,
+	matchesGlobs,
+} from "./globs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
 
 type SkillRecord = {
@@ -13,6 +18,7 @@ type SkillRecord = {
 	filePath: string;
 	baseDir: string;
 	globs?: string[];
+	disableModelInvocation?: boolean;
 };
 
 const DYNAMIC_BLOCK_PATTERN = /```!\s*\n?([\s\S]*?)\n?```/g;
@@ -40,7 +46,26 @@ function normalizeSkill(raw: unknown): SkillRecord | undefined {
 	const filePath = typeof obj.filePath === "string" ? obj.filePath : typeof obj.location === "string" ? obj.location : undefined;
 	const baseDir = typeof obj.baseDir === "string" ? obj.baseDir : filePath ? dirname(filePath) : undefined;
 	if (!name || !filePath || !baseDir) return undefined;
-	return { name, filePath, baseDir };
+
+	let globs = Array.isArray(obj.globs) ? obj.globs.filter((glob): glob is string => typeof glob === "string") : undefined;
+	let disableModelInvocation: boolean | undefined;
+	if (typeof obj.disableModelInvocation === "boolean") {
+		disableModelInvocation = obj.disableModelInvocation;
+	} else if (typeof obj["disable-model-invocation"] === "boolean") {
+		disableModelInvocation = obj["disable-model-invocation"];
+	}
+
+	if (!globs || disableModelInvocation === undefined) {
+		try {
+			const content = readFileSync(filePath, "utf-8");
+			globs = globs ?? extractGlobs(content);
+			disableModelInvocation = disableModelInvocation ?? (extractDisableModelInvocation(content) || undefined);
+		} catch {
+			// Keep the normalized record without optional frontmatter fields.
+		}
+	}
+
+	return { name, filePath, baseDir, globs, disableModelInvocation };
 }
 
 // ponytail: hand-rolls pi's package cache layout. Only `git:github.com/...`
@@ -170,9 +195,11 @@ function scanSkillRoots(roots: string[]): SkillRecord[] {
 		if (entries.some((entry) => entry.isFile() && entry.name === "SKILL.md")) {
 			const skillPath = join(dir, "SKILL.md");
 			let globs: string[] | undefined;
+			let disableModelInvocation: boolean | undefined;
 			try {
 				const content = readFileSync(skillPath, "utf-8");
 				globs = extractGlobs(content);
+				disableModelInvocation = extractDisableModelInvocation(content) || undefined;
 			} catch {
 				// Silently skip unreadable SKILL.md
 			}
@@ -181,6 +208,7 @@ function scanSkillRoots(roots: string[]): SkillRecord[] {
 				filePath: skillPath,
 				baseDir: dir,
 				globs,
+				disableModelInvocation,
 			});
 			return;
 		}
@@ -381,9 +409,13 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		for (const skill of scanSkillRoots(roots)) {
 			const existing = next.get(skill.name);
 			if (existing) {
-				// Filesystem skill may have richer data (e.g. globs). Merge globs in.
-				if (skill.globs && !existing.globs) {
-					next.set(skill.name, { ...existing, globs: skill.globs });
+				// Filesystem skill may have richer data (e.g. globs and frontmatter flags). Merge it in.
+				if ((skill.globs && !existing.globs) || skill.disableModelInvocation !== undefined) {
+					next.set(skill.name, {
+						...existing,
+						globs: existing.globs ?? skill.globs,
+						disableModelInvocation: existing.disableModelInvocation ?? skill.disableModelInvocation,
+					});
 				}
 			} else {
 				next.set(skill.name, skill);
@@ -700,7 +732,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (event.toolName === "read" && readPath) {
 			const resolvedPath = resolve(readPath);
 			for (const s of skills.values()) {
-				if (!hasGlobs(s)) continue;
+				if (!hasAutoInjectableGlobs(s)) continue;
 				if (skill && skill.name === s.name) continue;
 				// Per-turn deduplication: don't re-inject skills already loaded this turn
 				if (injectedThisTurn.has(s.name)) continue;

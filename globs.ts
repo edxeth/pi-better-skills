@@ -5,6 +5,7 @@ export interface SkillWithGlobs {
 	filePath: string;
 	baseDir: string;
 	globs?: string[];
+	disableModelInvocation?: boolean;
 }
 
 const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---/;
@@ -74,6 +75,15 @@ function collectListItems(lines: string[], startIndex: number): string[] {
 	return items;
 }
 
+function extractFrontmatterBoolean(yamlBlock: string, key: string): boolean | undefined {
+	const match = yamlBlock.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+	if (!match) return undefined;
+	const value = match[1].trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+	if (value === "true") return true;
+	if (value === "false") return false;
+	return undefined;
+}
+
 /**
  * Extract the `globs` field from SKILL.md frontmatter.
  * Returns undefined if the field is missing, empty, or unparseable.
@@ -91,10 +101,23 @@ export function extractGlobs(content: string): string[] | undefined {
 }
 
 /**
+ * Extract the `disable-model-invocation` field from SKILL.md frontmatter.
+ */
+export function extractDisableModelInvocation(content: string): boolean {
+	const fmMatch = content.match(FRONTMATTER_PATTERN);
+	if (!fmMatch) return false;
+	return extractFrontmatterBoolean(fmMatch[1], "disable-model-invocation") === true;
+}
+
+/**
  * Returns true if the skill has non-empty globs configured.
  */
 export function hasGlobs(skill: SkillWithGlobs): boolean {
 	return Array.isArray(skill.globs) && skill.globs.length > 0;
+}
+
+export function hasAutoInjectableGlobs(skill: SkillWithGlobs): boolean {
+	return hasGlobs(skill) && !skill.disableModelInvocation;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { extractGlobs, matchesGlobs, hasGlobs, SkillWithGlobs } from "../globs";
+import { extractGlobs, extractDisableModelInvocation, matchesGlobs, hasGlobs, hasAutoInjectableGlobs, SkillWithGlobs } from "../globs";
 
 /**
  * Helper to create a minimal skill record for testing.
@@ -71,6 +71,20 @@ globs: []
 	});
 });
 
+describe("extractDisableModelInvocation", () => {
+	it("returns true when disable-model-invocation is true", () => {
+		const content = `---
+name: test-skill
+description: Test
+disable-model-invocation: true
+globs: ["**/*.tsx"]
+---
+# Skill content
+`;
+		expect(extractDisableModelInvocation(content)).toBe(true);
+	});
+});
+
 describe("hasGlobs", () => {
 	it("returns true when globs are present", () => {
 		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: ["*.ts"] };
@@ -85,6 +99,24 @@ describe("hasGlobs", () => {
 	it("returns false when globs is empty array", () => {
 		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: [] };
 		expect(hasGlobs(skill)).toBe(false);
+	});
+});
+
+describe("hasAutoInjectableGlobs", () => {
+	it("returns true for enabled skills with globs", () => {
+		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: ["*.ts"] };
+		expect(hasAutoInjectableGlobs(skill)).toBe(true);
+	});
+
+	it("returns false for disabled model-invocation skills even when globs are present", () => {
+		const skill = {
+			name: "test",
+			filePath: "/path/SKILL.md",
+			baseDir: "/path",
+			globs: ["*.ts"],
+			disableModelInvocation: true,
+		};
+		expect(hasAutoInjectableGlobs(skill)).toBe(false);
 	});
 });
 

@@ -265,6 +265,8 @@ Dot files are matched. Bare patterns without a `/` match against the filename, s
 
 The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block with path resolution hints, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills. They only run when you read the skill directly.
 
+Skills with `disable-model-invocation: true` are not auto-injected by `globs`. They remain available through explicit `/skill:name` commands, matching Pi's opt-out semantics for model-driven invocation.
+
 ### When globs don't match
 
 The extension is a no-op. Skills without `globs` behave like before.
