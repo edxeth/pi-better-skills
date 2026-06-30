@@ -36,7 +36,7 @@ describe("extractInlineSkillDisplays leading skill", () => {
 });
 
 describe("extractInlineSkillDisplays visible prompt cleanup", () => {
-	it("can extract the leading skill when the extension owns a multi-skill prompt", () => {
+	it("replaces leading tokens with bare names when the extension owns a multi-skill prompt", () => {
 		const extract = harness(["torpathy", "ask-matt"]);
 		const result = extractInlineSkillDisplays(
 			"/skill:torpathy what's the best architecture? /skill:ask-matt",
@@ -47,7 +47,7 @@ describe("extractInlineSkillDisplays visible prompt cleanup", () => {
 		);
 
 		expect(result!.skills.map((skill) => skill.name)).toEqual(["torpathy", "ask-matt"]);
-		expect(result!.text).toBe("what's the best architecture?");
+		expect(result!.text).toBe("torpathy what's the best architecture? ask-matt");
 	});
 
 	it("removes a non-leading token and keeps the leading skill for core by default", () => {
@@ -96,6 +96,30 @@ describe("extractInlineSkillDisplays visible prompt cleanup", () => {
 		expect(result!.skills.map((skill) => skill.name)).toEqual(["a", "b"]);
 		expect(result!.text.startsWith("hello")).toBe(true);
 		expect(result!.text).not.toContain("/skill:");
+	});
+});
+
+describe("extractInlineSkillDisplays bare-name substitution", () => {
+	it("replaces a mid-text token with the bare skill name so the sentence stays whole", () => {
+		const extract = harness(["improve-codebase-architecture", "grill-with-docs"]);
+		const result = extract(
+			"using the /skill:improve-codebase-architecture along with /skill:grill-with-docs let's improve",
+		);
+
+		expect(result!.text).toBe(
+			"using the improve-codebase-architecture along with grill-with-docs let's improve",
+		);
+		expect(result!.skills.map((skill) => skill.name)).toEqual([
+			"improve-codebase-architecture",
+			"grill-with-docs",
+		]);
+	});
+
+	it("leaves no whitespace gap for a single mid-text reference", () => {
+		const extract = harness(["diagnosing-bugs"]);
+		const result = extract("I added the skill /skill:diagnosing-bugs inline here");
+
+		expect(result!.text).toBe("I added the skill diagnosing-bugs inline here");
 	});
 });
 

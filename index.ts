@@ -181,11 +181,17 @@ function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDi
 }
 
 /**
- * Remove resolvable `/skill:<name>` tokens from user text and return them as
- * separate skill-display records. By default the leading token is skipped so pi
- * core can keep handling ordinary single-skill commands. Pass
- * `includeLeading: true` when the extension owns the whole multi-skill prompt.
- * Unknown or unreadable skills are left verbatim so core/pi can report them.
+ * Replace resolvable `/skill:<name>` tokens in user text with the bare skill
+ * `name`, and return the referenced skills as separate skill-display records.
+ * Leaving the bare name keeps the user's sentence readable (no gap) while the
+ * skill body is rendered as its own `[skill]` row above the prompt. Replacing
+ * (rather than keeping) the `/skill:` sigil also stops pi core from
+ * double-expanding a leading token, since the text no longer starts with it.
+ *
+ * By default the leading token is skipped so pi core can keep handling ordinary
+ * single-skill commands. Pass `includeLeading: true` when the extension owns the
+ * whole multi-skill prompt. Unknown or unreadable skills are left verbatim so
+ * core/pi can report them.
  *
  * `decorate`, if provided, wraps the skill body (e.g. with `<skill_context>`);
  * it receives the body and must return the inner content of the `<skill>` block.
@@ -205,8 +211,8 @@ export function extractInlineSkillDisplays(
 	});
 	if (matches.length === 0) return undefined;
 
-	type Removal = { start: number; end: number };
-	const removals: Removal[] = [];
+	type Replacement = { start: number; end: number; name: string };
+	const replacements: Replacement[] = [];
 	const skills: InlineSkillDisplay[] = [];
 
 	for (const match of matches) {
@@ -224,16 +230,16 @@ export function extractInlineSkillDisplays(
 
 		const inner = decorate ? decorate(body, skill) : body;
 		skills.push(formatInlineSkillDisplay(skill, inner));
-		removals.push({ start, end: start + match[0].length });
+		replacements.push({ start, end: start + match[0].length, name: skill.name });
 	}
 
-	if (removals.length === 0) return undefined;
+	if (replacements.length === 0) return undefined;
 
-	removals.sort((a, b) => a.start - b.start);
+	replacements.sort((a, b) => a.start - b.start);
 	let out = "";
 	let cursor = 0;
-	for (const { start, end } of removals) {
-		out += text.slice(cursor, start);
+	for (const { start, end, name } of replacements) {
+		out += text.slice(cursor, start) + name;
 		cursor = end;
 	}
 	out += text.slice(cursor);
