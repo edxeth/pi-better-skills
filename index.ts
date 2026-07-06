@@ -173,6 +173,18 @@ function inlineSkillMessage(skill: InlineSkillDisplay): {
 	};
 }
 
+/**
+ * Combine extracted skill blocks with the cleaned user text into a single string.
+ * Used for steer/followUp delivery: the steering queue defaults to
+ * "one-at-a-time", so separate skill messages would each drain in their own turn
+ * and the skill body would be invoked before the user's text ever arrives. Keeping
+ * them in one queued entry makes the skill and the instruction travel together.
+ */
+export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[]): string {
+	const blocks = skills.map((skill) => skill.block).join("\n\n");
+	return blocks ? `${blocks}\n\n${text}` : text;
+}
+
 function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDisplay[]): boolean {
 	if (skills.length !== 1) return false;
 	const token = `/skill:${skills[0].name}`;
@@ -689,9 +701,16 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		);
 		if (!result || isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) return;
 
-		const deliverAs = event.streamingBehavior;
+		// While streaming, steer/followUp queues drain one entry at a time by default,
+		// so a separate skill message would be delivered alone in its own turn and the
+		// skill invoked before the user's queued text arrives. Inline the skill blocks
+		// into the single queued message so they travel together.
+		if (event.streamingBehavior) {
+			return { action: "transform" as const, text: inlineSkillsIntoText(result.text, result.skills) };
+		}
+
 		for (const skill of result.skills) {
-			pi.sendMessage(inlineSkillMessage(skill), { deliverAs });
+			pi.sendMessage(inlineSkillMessage(skill));
 		}
 
 		return { action: "transform" as const, text: result.text };
