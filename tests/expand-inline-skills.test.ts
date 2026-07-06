@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { extractInlineSkillDisplays, inlineSkillsIntoText, type InlineSkillRef } from "../index";
+import { extractInlineSkillDisplays, inlineSkillsIntoText, planInlineSkillDelivery, type InlineSkillRef } from "../index";
 
 /**
  * `extractInlineSkillDisplays` lets one message reference multiple skills without
@@ -167,6 +167,39 @@ describe("inlineSkillsIntoText (steer/followUp single-entry delivery)", () => {
 
 	it("returns the text unchanged when there are no skills", () => {
 		expect(inlineSkillsIntoText("just text", [])).toBe("just text");
+	});
+});
+
+describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
+	function extractTwo() {
+		return extractInlineSkillDisplays(
+			"do X with /skill:a and /skill:b",
+			(name) => (["a", "b"].includes(name) ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		)!;
+	}
+
+	it("streaming: sends NO separate messages and inlines every block into the text", () => {
+		const result = extractTwo();
+		const plan = planInlineSkillDelivery(result, true);
+
+		// The bug was separate skill messages splitting across one-at-a-time drains.
+		expect(plan.messages).toEqual([]);
+		expect(plan.text).toBe(inlineSkillsIntoText(result.text, result.skills));
+		expect(plan.text).toContain("a body");
+		expect(plan.text).toContain("b body");
+		expect(plan.text.trimEnd().endsWith(result.text)).toBe(true);
+	});
+
+	it("idle: keeps skills as separate messages and leaves the user text clean", () => {
+		const result = extractTwo();
+		const plan = planInlineSkillDelivery(result, false);
+
+		expect(plan.messages).toBe(result.skills);
+		expect(plan.text).toBe(result.text);
+		expect(plan.text).not.toContain("a body");
 	});
 });
 
