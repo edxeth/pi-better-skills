@@ -173,6 +173,48 @@ function inlineSkillMessage(skill: InlineSkillDisplay): {
 	};
 }
 
+/**
+ * Combine extracted skill blocks with the cleaned user text into a single string.
+ * Used for steer/followUp delivery: the steering queue defaults to
+ * "one-at-a-time", so separate skill messages would each drain in their own turn
+ * and the skill body would be invoked before the user's text ever arrives. Keeping
+ * them in one queued entry makes the skill and the instruction travel together.
+ */
+export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[]): string {
+	const blocks = skills.map((skill) => skill.block).join("\n\n");
+	return blocks ? `${blocks}\n\n${text}` : text;
+}
+
+/**
+ * Decide how extracted skills are delivered alongside the cleaned user text.
+ *
+ * Idle: skills ride as separate custom messages (rendered as collapsible
+ * `[skill]` rows) that land in the same turn as the user prompt.
+ *
+ * Streaming: steer/followUp queues drain one entry at a time by default, so a
+ * separate skill message would be delivered alone in its own turn and invoked
+ * before the user's queued text arrives. Inline the blocks into the single
+ * transformed text instead (no `[skill]` row, but skill + instruction stay
+ * together). This is the seam the streaming regression turns on.
+ *
+ * Exception: if the cleaned prompt still starts with a slash-command (e.g. a
+ * leading prompt-template `/tmpl ...`), it must stay at position 0 so pi core's
+ * prompt-template expansion (which requires `text.startsWith("/")` and replaces
+ * the whole message) still fires. Prepending skill XML would bury it. In that
+ * rare template+skill combo we fall back to separate skill messages: the
+ * template keeps expanding, and the skills may split across one-at-a-time drains
+ * as they did before this fix.
+ */
+export function planInlineSkillDelivery(
+	result: { text: string; skills: InlineSkillDisplay[] },
+	streaming: boolean,
+): { text: string; messages: InlineSkillDisplay[] } {
+	if (streaming && !result.text.startsWith("/")) {
+		return { text: inlineSkillsIntoText(result.text, result.skills), messages: [] };
+	}
+	return { text: result.text, messages: result.skills };
+}
+
 function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDisplay[]): boolean {
 	if (skills.length !== 1) return false;
 	const token = `/skill:${skills[0].name}`;
@@ -689,12 +731,13 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		);
 		if (!result || isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) return;
 
-		const deliverAs = event.streamingBehavior;
-		for (const skill of result.skills) {
-			pi.sendMessage(inlineSkillMessage(skill), { deliverAs });
+		const { text, messages } = planInlineSkillDelivery(result, Boolean(event.streamingBehavior));
+		const options = event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined;
+		for (const skill of messages) {
+			pi.sendMessage(inlineSkillMessage(skill), options);
 		}
 
-		return { action: "transform" as const, text: result.text };
+		return { action: "transform" as const, text };
 	});
 
 	pi.on("turn_start", async () => {

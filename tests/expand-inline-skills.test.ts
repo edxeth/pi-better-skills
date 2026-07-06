@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { extractInlineSkillDisplays, type InlineSkillRef } from "../index";
+import { extractInlineSkillDisplays, inlineSkillsIntoText, planInlineSkillDelivery, type InlineSkillRef } from "../index";
 
 /**
  * `extractInlineSkillDisplays` lets one message reference multiple skills without
@@ -142,6 +142,83 @@ describe("extractInlineSkillDisplays decoration (<skill_context>)", () => {
 		const result = extract("/skill:lead /skill:tdd hi");
 		expect(result!.skills[0].block).not.toContain("<skill_context>");
 		expect(result!.skills[0].block).toContain("\n\nBODY\n</skill>");
+	});
+});
+
+describe("inlineSkillsIntoText (steer/followUp single-entry delivery)", () => {
+	// Regression: during streaming the steering queue drains one entry at a time,
+	// so skills must ride inside the same queued message as the user text — never
+	// as separate messages that would invoke the skill in its own earlier turn.
+	it("prepends every skill block before the user text as one string", () => {
+		const result = extractInlineSkillDisplays(
+			"do X with /skill:a and /skill:b",
+			(name) => (["a", "b"].includes(name) ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		)!;
+		const combined = inlineSkillsIntoText(result.text, result.skills);
+
+		expect(combined).toBe(`${result.skills[0].block}\n\n${result.skills[1].block}\n\n${result.text}`);
+		expect(combined).toContain("a body");
+		expect(combined).toContain("b body");
+		expect(combined.trimEnd().endsWith(result.text)).toBe(true);
+	});
+
+	it("returns the text unchanged when there are no skills", () => {
+		expect(inlineSkillsIntoText("just text", [])).toBe("just text");
+	});
+});
+
+describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
+	function extractTwo() {
+		return extractInlineSkillDisplays(
+			"do X with /skill:a and /skill:b",
+			(name) => (["a", "b"].includes(name) ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		)!;
+	}
+
+	it("streaming: sends NO separate messages and inlines every block into the text", () => {
+		const result = extractTwo();
+		const plan = planInlineSkillDelivery(result, true);
+
+		// The bug was separate skill messages splitting across one-at-a-time drains.
+		expect(plan.messages).toEqual([]);
+		expect(plan.text).toBe(inlineSkillsIntoText(result.text, result.skills));
+		expect(plan.text).toContain("a body");
+		expect(plan.text).toContain("b body");
+		expect(plan.text.trimEnd().endsWith(result.text)).toBe(true);
+	});
+
+	it("idle: keeps skills as separate messages and leaves the user text clean", () => {
+		const result = extractTwo();
+		const plan = planInlineSkillDelivery(result, false);
+
+		expect(plan.messages).toBe(result.skills);
+		expect(plan.text).toBe(result.text);
+		expect(plan.text).not.toContain("a body");
+	});
+
+	it("streaming with a leading slash-command: does NOT inline, so core can still expand it", () => {
+		// e.g. `/tmpl arg /skill:a` -> cleaned text `/tmpl arg a`. Prepending skill XML
+		// would move the leading `/tmpl` off position 0 and defeat core's prompt-template
+		// expansion (which requires text.startsWith("/")). Fall back to separate messages.
+		const result = extractInlineSkillDisplays(
+			"/tmpl arg /skill:a",
+			(name) => (name === "a" ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		)!;
+		expect(result.text).toBe("/tmpl arg a");
+
+		const plan = planInlineSkillDelivery(result, true);
+		expect(plan.text).toBe("/tmpl arg a"); // leading token preserved at position 0
+		expect(plan.messages).toBe(result.skills); // skill delivered as a separate message
+		expect(plan.text.startsWith("/")).toBe(true);
 	});
 });
 
