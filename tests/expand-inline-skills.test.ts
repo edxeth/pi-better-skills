@@ -201,6 +201,25 @@ describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
 		expect(plan.text).toBe(result.text);
 		expect(plan.text).not.toContain("a body");
 	});
+
+	it("streaming with a leading slash-command: does NOT inline, so core can still expand it", () => {
+		// e.g. `/tmpl arg /skill:a` -> cleaned text `/tmpl arg a`. Prepending skill XML
+		// would move the leading `/tmpl` off position 0 and defeat core's prompt-template
+		// expansion (which requires text.startsWith("/")). Fall back to separate messages.
+		const result = extractInlineSkillDisplays(
+			"/tmpl arg /skill:a",
+			(name) => (name === "a" ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		)!;
+		expect(result.text).toBe("/tmpl arg a");
+
+		const plan = planInlineSkillDelivery(result, true);
+		expect(plan.text).toBe("/tmpl arg a"); // leading token preserved at position 0
+		expect(plan.messages).toBe(result.skills); // skill delivered as a separate message
+		expect(plan.text.startsWith("/")).toBe(true);
+	});
 });
 
 describe("extractInlineSkillDisplays unknown / unreadable skills", () => {

@@ -196,12 +196,22 @@ export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[])
  * before the user's queued text arrives. Inline the blocks into the single
  * transformed text instead (no `[skill]` row, but skill + instruction stay
  * together). This is the seam the streaming regression turns on.
+ *
+ * Exception: if the cleaned prompt still starts with a slash-command (e.g. a
+ * leading prompt-template `/tmpl ...`), it must stay at position 0 so pi core's
+ * prompt-template expansion (which requires `text.startsWith("/")` and replaces
+ * the whole message) still fires. Prepending skill XML would bury it. In that
+ * rare template+skill combo we fall back to separate skill messages: the
+ * template keeps expanding, and the skills may split across one-at-a-time drains
+ * as they did before this fix.
  */
 export function planInlineSkillDelivery(
 	result: { text: string; skills: InlineSkillDisplay[] },
 	streaming: boolean,
 ): { text: string; messages: InlineSkillDisplay[] } {
-	if (streaming) return { text: inlineSkillsIntoText(result.text, result.skills), messages: [] };
+	if (streaming && !result.text.startsWith("/")) {
+		return { text: inlineSkillsIntoText(result.text, result.skills), messages: [] };
+	}
 	return { text: result.text, messages: result.skills };
 }
 
@@ -722,8 +732,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (!result || isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) return;
 
 		const { text, messages } = planInlineSkillDelivery(result, Boolean(event.streamingBehavior));
+		const options = event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined;
 		for (const skill of messages) {
-			pi.sendMessage(inlineSkillMessage(skill));
+			pi.sendMessage(inlineSkillMessage(skill), options);
 		}
 
 		return { action: "transform" as const, text };
