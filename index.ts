@@ -12,6 +12,14 @@ import {
 	hasAutoInjectableGlobs,
 	matchesGlobs,
 } from "./globs";
+import {
+	DYNAMIC_BLOCK_PATTERN,
+	DYNAMIC_INLINE_PATTERN,
+	collectSkillReferences,
+	hasResolvableReference,
+	neutralizeDynamicPlaceholders,
+	type RefDeps,
+} from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
 
 type SkillRecord = {
@@ -22,8 +30,6 @@ type SkillRecord = {
 	disableModelInvocation?: boolean;
 };
 
-const DYNAMIC_BLOCK_PATTERN = /```!\s*\n?([\s\S]*?)\n?```/g;
-const DYNAMIC_INLINE_PATTERN = /(^|\s)!`([^`]+)`/gm;
 const MAX_DYNAMIC_OUTPUT_CHARS = 50_000;
 const VALID_THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
 const execAsync = promisify(exec);
@@ -72,10 +78,13 @@ function normalizeSkill(raw: unknown): SkillRecord | undefined {
 // ponytail: hand-rolls pi's package cache layout. Only `git:github.com/...`
 // specs resolve to ~/.pi/agent/git/...; it does NOT cover npm specs, SSH/https
 // git URLs, branch refs (git:...@ref), project-local .pi/settings.json, or
-// per-package `skills: []` filters. before_agent_start still merges pi's
-// authoritative loaded set at runtime, so affected skills merely lack
-// pre-prompt discovery (never resolution). Upgrade to an extension API
-// exposing active skill roots when pi provides one.
+// per-package `skills: []` filters. Discovery also hand-rolls pi's other skill
+// locations (settings `skills` arrays, CLI --skill paths, project
+// .agents/skills ancestors) because the input event fires before
+// before_agent_start merges pi's authoritative loaded set — without this,
+// fresh-session /skill:name prompts cannot resolve those skills.
+// before_agent_start still merges the authoritative set at runtime. Upgrade to
+// an extension API exposing active skill roots when pi provides one.
 function packageRootFromSource(source: string): string | undefined {
 	if (source.startsWith("/") || source.startsWith("~/")) return homePath(source);
 	if (!source.startsWith("git:")) return undefined;
@@ -99,6 +108,85 @@ function activePackageRootsFromSettings(): string[] {
 	} catch {
 		return [];
 	}
+}
+
+/** CLI `--skill <path>` / `--skill=<path>` entries from the live pi invocation. */
+export function cliSkillPaths(argv: string[] = process.argv): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--skill" && argv[i + 1] !== undefined) {
+			out.push(argv[i + 1]!);
+			i++;
+		} else if (arg.startsWith("--skill=")) {
+			out.push(arg.slice("--skill=".length));
+		}
+	}
+	return out.map(homePath).filter(Boolean);
+}
+
+/**
+ * `skills` array entries (files or directories) from user and project settings.
+ * Entries resolve against the session cwd, matching pi's loader
+ * (`resolvePath(entry, cwd)`). Project settings are only read for trusted
+ * projects, mirroring pi's project-trust gate for project-local content.
+ */
+export function settingsSkillPaths(cwd: string, trusted = false): string[] {
+	const out: string[] = [];
+	const sources: Array<{ file: string; project: boolean }> = [
+		{ file: homePath("~/.pi/agent/settings.json"), project: false },
+		{ file: resolve(cwd, ".pi/settings.json"), project: true },
+	];
+	for (const { file, project } of sources) {
+		if (project && !trusted) continue;
+		try {
+			const settings = JSON.parse(readFileSync(file, "utf-8")) as { skills?: unknown };
+			for (const entry of Array.isArray(settings.skills) ? settings.skills : []) {
+				if (typeof entry !== "string") continue;
+				const expanded = homePath(entry);
+				out.push(isAbsolute(expanded) ? expanded : resolve(cwd, expanded));
+			}
+		} catch {
+			// Missing or invalid settings file: skip it.
+		}
+	}
+	return out;
+}
+
+/**
+ * Project-scoped skill roots (`.pi/skills` and `.agents/skills` ancestors).
+ * Empty until the project is trusted: pi only admits project skills after
+ * trust, and pre-input discovery must not widen that boundary.
+ */
+export function projectSkillRoots(cwd: string, trusted: boolean): string[] {
+	if (!trusted) return [];
+	return [resolve(cwd, ".pi/skills"), ...projectAgentsSkillRoots(cwd)];
+}
+
+/** True when the tool result text actually contains the skill's body opening. */
+export function resultConfirmsSkillBody(resultText: string, skillBody: string): boolean {
+	const collapse = (s: string) => s.replace(/\s+/g, " ").trim();
+	const body = collapse(skillBody);
+	if (!body) return false;
+	return collapse(resultText).includes(body.slice(0, 80));
+}
+
+/**
+ * Project `.agents/skills` directories in `cwd` and ancestor directories, up to
+ * the git repo root (or filesystem root outside a repo), mirroring pi's
+ * project skill discovery. Nonexistent dirs are ignored by the scanner.
+ */
+export function projectAgentsSkillRoots(cwd: string, rootExists: (dir: string) => boolean = existsSync): string[] {
+	const out: string[] = [];
+	let dir = resolve(cwd);
+	for (;;) {
+		out.push(join(dir, ".agents", "skills"));
+		if (rootExists(join(dir, ".git"))) break;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +311,34 @@ function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDi
 }
 
 /**
+ * Collect backticked skill references for a batch of inline skill displays.
+ * Referenced skills are appended as their own displays, so they render as
+ * separate `[skill]` rows and travel with the same delivery plan as parents.
+ * Parent bodies are never rewritten; injection is purely additive.
+ *
+ * `injected` records every skill whose body enters context this session so the
+ * same reference is never injected twice (cleared when compaction may have
+ * summarized the earlier bodies away).
+ */
+export function commitRefExpansion(batch: InlineSkillDisplay[], deps: RefDeps, injected: Set<string>): InlineSkillDisplay[] {
+	const out = [...batch];
+	for (const display of batch) {
+		const refs = collectSkillReferences(display.name, display.content, {
+			...deps,
+			// Also skip skills already staged in this batch (e.g. a parent referencing
+			// another parent) so they are not duplicated as reference rows.
+			alreadyInjected: (name) => injected.has(name) || out.some((staged) => staged.name === name),
+		});
+		injected.add(display.name);
+		for (const ref of refs) {
+			out.push(formatInlineSkillDisplay(ref.skill, ref.decoratedBody));
+			injected.add(ref.skill.name);
+		}
+	}
+	return out;
+}
+
+/**
  * Replace resolvable `/skill:<name>` tokens in user text with the bare skill
  * `name`, and return the referenced skills as separate skill-display records.
  * Leaving the bare name keeps the user's sentence readable (no gap) while the
@@ -339,6 +455,30 @@ function scanSkillRoots(roots: string[]): SkillRecord[] {
 	return out;
 }
 
+/** Skill record for a direct `.md` file entry (CLI/settings), named by frontmatter or filename. */
+export function skillRecordForFile(file: string): SkillRecord | undefined {
+	let content: string;
+	try {
+		content = readFileSync(file, "utf-8");
+	} catch {
+		return undefined;
+	}
+	const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+	const fmName = frontmatter?.[1]?.match(/^name:\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "");
+	const fmDescription = frontmatter?.[1]?.match(/^description:\s*(.+)$/m)?.[1]?.trim();
+	const name = fmName || file.split(/[\\/]/).pop()?.replace(/\.md$/, "");
+	const globs = extractGlobs(content) ?? [];
+	// pi does not load skills without a description; match that contract here.
+	if (!name || !fmDescription) return undefined;
+	return {
+		name,
+		filePath: file,
+		baseDir: dirname(file),
+		globs: globs.length ? globs : undefined,
+		disableModelInvocation: extractDisableModelInvocation(content) || undefined,
+	};
+}
+
 function shellQuote(path: string): string {
 	return `'${path.replace(/'/g, `'"'"'`)}'`;
 }
@@ -386,6 +526,27 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	let activeSkill: SkillRecord | undefined;
 	// Tracks skills auto-injected via globs in the current turn (deduplication).
 	let injectedThisTurn = new Set<string>();
+	// Tracks skills whose full body is already in context this session, so the
+	// same backticked reference is never expanded twice. Cleared on compaction.
+	let injectedSkillNames = new Set<string>();
+
+	function refDeps(cwd: string): RefDeps {
+		return {
+			// Deliberately unfiltered: skills with disable-model-invocation stay
+			// referenceable — referencing a sibling from a loaded skill is an
+			// explicit author choice, unlike passive globs auto-injection.
+			resolve: (name) => skills.get(name),
+			readBody(skill) {
+				try {
+					return stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+				} catch {
+					return undefined;
+				}
+			},
+			decorate: (body, skill) => insertSkillContext(body, skill, cwd),
+			alreadyInjected: (name) => injectedSkillNames.has(name),
+		};
+	}
 
 	// ---------------------------------------------------------------------------
 	// Model/thinking override state
@@ -493,7 +654,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// Skill discovery
 	// ---------------------------------------------------------------------------
 
-	function refreshSkills(cwd: string, loaded?: unknown[]) {
+	function refreshSkills(cwd: string, loaded?: unknown[], trusted = false) {
 		const next = new Map<string, SkillRecord>();
 		for (const skill of loaded ?? []) {
 			const normalized = normalizeSkill(skill);
@@ -503,8 +664,18 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		const roots = [
 			homePath("~/.pi/agent/skills"),
 			homePath("~/.agents/skills"),
-			resolve(cwd, ".pi/skills"),
+			...projectSkillRoots(cwd, trusted),
 		];
+		// CLI and settings entries can be skill directories or direct .md files.
+		// Directory entries join the recursive scan; file entries become records
+		// directly so sibling files in the same directory are not over-discovered.
+		const fileEntries: string[] = [];
+		// CLI --skill entries are explicit user actions (pi loads them even with
+			// --no-skills) and are not gated by project trust.
+		for (const entry of [...settingsSkillPaths(cwd, trusted), ...cliSkillPaths()]) {
+			if (entry.endsWith(".md")) fileEntries.push(entry);
+			else roots.push(entry);
+		}
 		// Active package roots are session-static; parse settings once.
 		if (!cachedPackageRoots) cachedPackageRoots = activePackageRootsFromSettings();
 		// Package skills live under <pkg>/skills/** (or <pkg>/SKILL.md); don't walk the
@@ -513,7 +684,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			roots.push(join(root, "skills"));
 			if (existsSync(join(root, "SKILL.md"))) roots.push(root);
 		}
-		for (const skill of scanSkillRoots(roots)) {
+		for (const skill of [...scanSkillRoots(roots), ...fileEntries.map(skillRecordForFile).filter((s): s is SkillRecord => !!s)]) {
 			const existing = next.get(skill.name);
 			if (existing) {
 				// Filesystem skill may have richer data (e.g. globs and frontmatter flags). Merge it in.
@@ -602,11 +773,11 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// Skill context injection
 	// ---------------------------------------------------------------------------
 
-	function skillContextBlock(skill: SkillRecord, workspace: string): string {
+	function skillContextBlock(skill: { baseDir: string }, workspace: string): string {
 		return `<skill_context>\n  <skill_dir>${skill.baseDir}</skill_dir>\n  <workspace_dir>${workspace}</workspace_dir>\n\n  <path_policy>\n    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.\n    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.\n    Use $PI_SKILL_DIR/path for explicit bundled skill files.\n    Use $PI_WORKSPACE/path for explicit workspace/project files.\n  </path_policy>\n</skill_context>`;
 	}
 
-	function insertSkillContext(text: string, skill: SkillRecord, workspace: string): string {
+	function insertSkillContext(text: string, skill: { baseDir: string }, workspace: string): string {
 		if (text.includes("<skill_context>")) return text;
 		const context = skillContextBlock(skill, workspace);
 		const frontmatter = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
@@ -625,6 +796,26 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			if (skill) return skill;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Command-driven skill detection (bash / arbitrary tools) is only a real
+	 * skill load when the tool result actually contains the skill's body.
+	 * `echo`, `stat`, or `ls` mentioning a SKILL.md path must not trigger
+	 * enrichment or mark the skill injected.
+	 */
+	function confirmedSkillRead(event: { content: Array<{ type: string; text?: string }> }, skill: SkillRecord): boolean {
+		let body: string;
+		try {
+			body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+		} catch {
+			return false;
+		}
+		const text = event.content
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text)
+			.join("\n");
+		return resultConfirmsSkillBody(text, body);
 	}
 
 	function rewriteCommand(command: string, cwd: string): string {
@@ -710,13 +901,23 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.registerMessageRenderer("skill", renderInlineSkillBatch as any);
 
 	pi.on("session_start", async (_event, ctx) => {
-		refreshSkills(ctx.cwd);
+		injectedSkillNames = new Set();
+		refreshSkills(ctx.cwd, undefined, ctx.isProjectTrusted());
 		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => skillList);
+	});
+
+	// Compaction can summarize previously injected skill bodies out of context;
+	// allow references to expand again afterwards.
+	pi.on("session_compact", async () => {
+		injectedSkillNames = new Set();
 	});
 
 	// Multi-skill prompts are handled entirely by the extension so both the TUI
 	// and the LLM see: skill rows first, cleaned user prompt second. Ordinary
-	// single leading `/skill:name` commands still fall through to pi core.
+	// single leading `/skill:name` commands still fall through to pi core —
+	// unless the skill composes others via backticked `/name` references, in
+	// which case the extension owns the whole expansion so parents and their
+	// referenced skills share one delivery plan.
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return; // don't rewrite extension-injected text
 		const result = extractInlineSkillDisplays(
@@ -729,9 +930,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			(body, skill) => insertSkillContext(body, skill, ctx.cwd),
 			{ includeLeading: true },
 		);
-		if (!result || isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) return;
+		if (!result) return;
+		if (isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) {
+			// No resolvable references -> keep pi core's ordinary single-skill expansion.
+			if (!hasResolvableReference(result.skills[0].content, (name) => skills.get(name))) return;
+		}
 
-		const { text, messages } = planInlineSkillDelivery(result, Boolean(event.streamingBehavior));
+		const batch = commitRefExpansion(result.skills, refDeps(ctx.cwd), injectedSkillNames);
+
+		const { text, messages } = planInlineSkillDelivery({ text: result.text, skills: batch }, Boolean(event.streamingBehavior));
 		const options = event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined;
 		for (const skill of messages) {
 			pi.sendMessage(inlineSkillMessage(skill), options);
@@ -745,12 +952,12 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	});
 
 	pi.on("resources_discover", async (_event, ctx) => {
-		refreshSkills(ctx.cwd);
+		refreshSkills(ctx.cwd, undefined, ctx.isProjectTrusted());
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
-		refreshSkills(ctx.cwd, loaded);
+		refreshSkills(ctx.cwd, loaded, ctx.isProjectTrusted());
 
 		return {
 			systemPrompt:
@@ -841,8 +1048,21 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		} else if (event.toolName === "bash") {
 			const command = typeof event.input.command === "string" ? event.input.command : undefined;
 			if (command) skill = findSkillReferencedByCommand(command, ctx.cwd);
+			if (skill && !confirmedSkillRead(event, skill)) return;
 		} else {
-			return;
+			// Tool-agnostic skill detection: any tool (e.g. an MCP `exec_command`)
+			// whose input strings reference a known SKILL.md path counts as a
+			// skill read and gets the same enrichment as core `read`/`bash`.
+			// Writes are excluded, and the result must actually contain the skill
+			// body — commands that merely mention the path (echo/stat/ls) must not
+			// mark a skill loaded or receive enrichment.
+			if (event.toolName === "edit" || event.toolName === "write") return;
+			for (const value of Object.values(event.input ?? {})) {
+				if (typeof value !== "string") continue;
+				skill = findSkillReferencedByCommand(value, ctx.cwd);
+				if (skill) break;
+			}
+			if (!skill || !confirmedSkillRead(event, skill)) return;
 		}
 
 		// Phase 2: Find skills whose globs match the read path (globs-based auto-injection)
@@ -874,22 +1094,30 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		for (const injSkill of toInject) {
 			try {
 				const rawContent = readFileSync(injSkill.filePath, "utf-8");
-				const contextInjected = insertSkillContext(rawContent, injSkill, ctx.cwd);
-				// Skip dynamic shell for auto-injected skills — it's a passive injection,
-				// not an explicit skill load. Dynamic shell is a side-effect footgun.
+				// Passive injection: collect backticked references, add path context,
+				// and neutralize (never execute) dynamic shell placeholders. The
+				// skill's own text is never rewritten.
+				const refs = collectSkillReferences(injSkill.name, rawContent, refDeps(ctx.cwd));
+				let injectedText = neutralizeDynamicPlaceholders(insertSkillContext(rawContent, injSkill, ctx.cwd));
+				for (const ref of refs) {
+					injectedSkillNames.add(ref.skill.name);
+					injectedText += `\n\n<skill name="${ref.skill.name}" location="${ref.skill.filePath}">\n${ref.decoratedBody}\n</skill>`;
+				}
 				allBlocks.unshift({
 					type: "text",
-					text: contextInjected,
+					text: injectedText,
 				});
 				injectedThisTurn.add(injSkill.name);
+				injectedSkillNames.add(injSkill.name);
 				changed = true;
 			} catch {
 				// Silently skip unreadable skills
 			}
 		}
 
-		// Phase 4: Process the main content blocks (skill context + dynamic shell)
+		// Phase 4: Process the main content blocks (skill context + dynamic shell + reference expansion)
 		let addedMainContext = false;
+		let mainRefs: ReturnType<typeof collectSkillReferences> = [];
 		const content = await Promise.all(
 			allBlocks.map(async (block) => {
 				if (block.type !== "text") return block;
@@ -897,16 +1125,35 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				if (!skill || !event.content.includes(block)) return block;
 				let text = block.text;
 				if (!addedMainContext) {
+					addedMainContext = true;
 					const fields = extractFrontmatterFields(text);
 					if (fields.model || fields.thinking) frontmatterFields = fields;
 					text = insertSkillContext(text, skill, ctx.cwd);
-					addedMainContext = true;
+					// Collect backticked `/name` references synchronously BEFORE any
+					// await and reserve them in the session set: parallel tool_result
+					// handlers interleave at await points, and unreserved names would
+					// let both handlers append the same child.
+					mainRefs = collectSkillReferences(skill.name, text, refDeps(ctx.cwd));
+					for (const ref of mainRefs) injectedSkillNames.add(ref.skill.name);
+					injectedSkillNames.add(skill.name);
+					text = await executeDynamicShell(text, skill, ctx.cwd);
+				} else {
+					text = await executeDynamicShell(text, skill, ctx.cwd);
 				}
-				text = await executeDynamicShell(text, skill, ctx.cwd);
 				if (text !== block.text) changed = true;
 				return { ...block, text };
 			}),
 		);
+
+		if (mainRefs.length > 0) {
+			for (const ref of mainRefs) {
+				content.push({
+					type: "text",
+					text: `<skill name="${ref.skill.name}" location="${ref.skill.filePath}">\n${ref.decoratedBody}\n</skill>`,
+				});
+			}
+			changed = true;
+		}
 
 		// Apply model/thinking overrides from frontmatter.
 		// Fire-and-forget: takes effect for the next LLM call, not the current in-flight turn.

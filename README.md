@@ -27,6 +27,8 @@ This extension gives the model the missing path context.
 pi install git:github.com/edxeth/pi-better-skills
 ```
 
+`pi-better-skills` needs a POSIX environment (macOS, Linux). Windows paths are not supported.
+
 New sessions load it automatically. Existing sessions need:
 
 ```text
@@ -283,7 +285,7 @@ Dot files are matched. Bare patterns without a `/` match against the filename, s
 
 ### What gets injected
 
-The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block with path resolution hints, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills. They only run when you read the skill directly.
+The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block with path resolution hints, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills — they are neutralized with a visible note. They only run when you read the skill directly.
 
 Skills with `disable-model-invocation: true` are not auto-injected by `globs`. They remain available through explicit `/skill:name` commands, matching Pi's opt-out semantics for model-driven invocation.
 
@@ -291,9 +293,59 @@ Skills with `disable-model-invocation: true` are not auto-injected by `globs`. T
 
 The extension is a no-op. Skills without `globs` behave like before.
 
+## Composing skills with inline references
+
+A `SKILL.md` body can include backticked slash references to other skills. The extension recognizes two token forms:
+
+- `` `/<skill-name>` `` — for example `` `/grilling` ``
+- `` `/skill:<skill-name>` `` — for example `` `/skill:grilling` ``
+
+```md
+Run a `/grilling` session, using the `/skill:prototype` skill.
+```
+
+When that skill loads, `pi-better-skills` injects the body of each referenced skill alongside it. The extension never rewrites a body. Injection is purely additive: references stay exactly as the author wrote them.
+
+The entire backticked content must be the token. Anything else — `` `git status` ``, `` `/usr/bin/env` ``, `` `./scripts/foo.sh` `` — is ordinary text and never matches.
+
+### Where references expand
+
+References expand wherever a skill body enters context:
+
+| Load path | Behavior |
+|----------|----------|
+| `/skill:name` command | The extension expands the command itself when the skill has resolvable references (extra `[skill]` rows appear before your prompt). Skills without references still use pi core's ordinary expansion. |
+| Model reads a `SKILL.md` | Referenced skill bodies are appended to the read result. |
+| `globs` auto-injection | Referenced skill bodies are appended to the injected block. |
+| Multi-skill input (`/skill:a ... /skill:b`) | Referenced skills arrive as their own `[skill]` rows. |
+| Any tool reading a `SKILL.md` | Detection is tool-agnostic: if a tool's input strings (for example the `cmd` of an `exec_command`) name a known `SKILL.md` path, the result gets the same enrichment as a core `read`. |
+
+### Rules
+
+- **Transitive, cycle-safe.** References of references expand too. One expansion never injects the same skill twice (diamonds collapse).
+- **Referenced skills can set `disable-model-invocation: true`.** Unlike passive `globs` injection, a backticked reference is an explicit author choice, so those skills inject anyway.
+- **Session-wide deduplication.** A referenced skill injects once per session. The memory resets after `/compact`, because compaction can remove the earlier body from the context.
+- **Unresolvable references inject nothing.** `` `/typo` `` stays as written and no block is appended when the name does not match an installed skill.
+- **Dynamic shell placeholders never run in referenced bodies.** The extension neutralizes them with a visible note. This keeps the promise that loaded content already contains command output.
+- **No model/thinking overrides from referenced skills.** Frontmatter `model`/`thinking` only apply to the skill you explicitly load.
+
+### Enabled state and session flags
+
+Resolution asks one question: does the skill exist at a known location? A reference injects even when pi did not load the skill for the current session. These cases include:
+
+- a session started with `--no-skills`,
+- a package skill excluded by its `skills` filter,
+- a skill that pi hides from the system prompt.
+
+`--no-skills` and package filters control discovery. They do not control access to files on disk. When you invoke a skill explicitly, you also ask for the skills that it references. If the extension refused a disabled dependency, the parent skill would operate without a skill that its author declared as necessary.
+
+Project trust still applies. The extension does not discover skills from a project that you did not trust, disabled or not. Dynamic shell placeholders in injected bodies never execute.
+
 ## Trust and safety
 
 Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.
+
+Project-scoped skills (`.pi/skills`, project `.agents/skills`, skill entries in project `.pi/settings.json`) are discovered only after you trust the project. This matches the boundary of pi itself. Global skills, packages, entries in `~/.pi/agent/settings.json`, and explicit CLI `--skill` paths are always discoverable.
 
 For that reason, dynamic shell execution is enabled by default only for user/global skill roots:
 
@@ -309,4 +361,3 @@ export PI_TRUST_PROJECT_SKILL_SHELL=1
 ```
 
 Only do this in repositories you trust.
-
