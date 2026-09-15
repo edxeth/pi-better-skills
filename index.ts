@@ -1125,6 +1125,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.isError) return;
+		// v1 explicit ownership contract: the producer owns raw reads and skill loading.
+		// Skip inference, globs, state changes, and expansion (see README).
+		const handling = (event.details as { piBetterSkills?: { version?: unknown; handling?: unknown } } | undefined)?.piBetterSkills;
+		if (handling?.version === 1 && handling.handling === "explicit") return;
 
 		// Phase 1: Identify the directly targeted skill (SKILL.md read / bash referencing SKILL.md)
 		let skill: SkillRecord | undefined;
