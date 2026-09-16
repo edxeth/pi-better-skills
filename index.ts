@@ -1063,7 +1063,8 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
   </path_policy>
   <dynamic_skill_shell>
     Dynamic SKILL.md shell placeholders receive PI_SKILL_DIR and PI_WORKSPACE.
-    If a SKILL.md contains dynamic shell placeholders like !\`command\` or fenced \`\`\`! blocks, the loaded/read skill content already contains their output; do not run those commands again unless the user asks.
+    Native read/bash skill results processed by this extension replace dynamic placeholders with output (or a skipped/failed notice); do not run those commands again unless the user asks.
+    Tools that explicitly own skill handling, such as exec, may return untouched raw SKILL.md snapshots. Raw reads do not expand placeholders or activate a skill: use the tool's explicit loader (for exec, loadSkill(path)) to load it with path/environment context and exactly-once expansion. Do not treat a raw snapshot as already expanded.
   </dynamic_skill_shell>
 </agent_skills>`,
 		};
@@ -1125,6 +1126,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.isError) return;
+		// v1 explicit ownership contract: the producer owns raw reads and skill loading.
+		// Skip inference, globs, state changes, and expansion (see README).
+		const handling = (event.details as { piBetterSkills?: { version?: unknown; handling?: unknown } } | undefined)?.piBetterSkills;
+		if (handling?.version === 1 && handling.handling === "explicit") return;
 
 		// Phase 1: Identify the directly targeted skill (SKILL.md read / bash referencing SKILL.md)
 		let skill: SkillRecord | undefined;

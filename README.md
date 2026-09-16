@@ -358,6 +358,28 @@ Resolution asks one question: does the skill exist at a known location? A refere
 
 Project trust still applies. The extension does not discover skills from a project that you did not trust, disabled or not. Dynamic shell placeholders in injected bodies never execute.
 
+## Explicit tool-result ownership (v1)
+
+Tools that own skill loading can opt out of this extension's entire `tool_result`
+handler by returning this metadata alongside their content:
+
+```ts
+{
+  content: [/* tool output */],
+  details: { piBetterSkills: { version: 1, handling: "explicit" } }
+}
+```
+
+Mark every result whose skill semantics the tool owns: both raw `SKILL.md` reads
+(which must remain raw) and explicitly loaded/preprocessed skills (which must not
+be expanded again). The producer owns path/environment context and exactly-once
+dynamic expansion. This marker is metadata, not text embedded in the output.
+
+For marked results, no input/output inference, glob injection, reference or shell
+expansion, active-skill/deduplication updates, or model/thinking overrides occur.
+The marker does not disable other hooks (including `tool_call`) or change
+unmarked tools. Unknown marker versions/values retain normal middleware behavior.
+
 ## Trust and safety
 
 Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.
