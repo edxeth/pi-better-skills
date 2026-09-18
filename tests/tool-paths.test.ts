@@ -16,49 +16,76 @@ describe("extractPathCandidates (structured keys)", () => {
 	it("ignores non-string and empty values", () => {
 		expect(extractPathCandidates({ path: 7, filePath: "", nested: { path: null } }, "/repo")).toEqual([]);
 	});
-});
 
-describe("extractPathCandidates (command string tokens)", () => {
-	it("extracts path-looking tokens from arbitrary string values", () => {
-		expect(extractPathCandidates({ cmd: "cat src/components/Button.widget" }, "/repo")).toEqual([
-			resolve("/repo/src/components/Button.widget"),
+	it("reads every entry of a list-valued path key", () => {
+		// MCP read_multiple_files and friends pass a list, not a single string.
+		expect(extractPathCandidates({ paths: ["src/App.tsx", "src/Other.tsx"] }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+			resolve("/repo/src/Other.tsx"),
+		]);
+		expect(extractPathCandidates({ files: ["a.css"], file_paths: ["b.css"] }, "/repo")).toEqual([
+			resolve("/repo/a.css"),
+			resolve("/repo/b.css"),
 		]);
 	});
 
-	it("resolves tokens against a workdir base key in the same record", () => {
-		expect(extractPathCandidates({ cmd: "sed -n 1,5p tests/helper.ts", workdir: "/repo/src" }, "/repo")).toEqual([
+	it("resolves a list-valued path key against a workdir base key", () => {
+		expect(extractPathCandidates({ workdir: "src", paths: ["App.tsx"] }, "/repo")).toEqual([
+			resolve("/repo/src"),
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+
+	it("skips non-string entries inside a list-valued path key", () => {
+		expect(extractPathCandidates({ paths: [7, null, "src/App.tsx", { path: "nested.tsx" }] }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+
+	it("scans path-looking strings in arbitrary lists without trusting bare words", () => {
+		expect(extractPathCandidates({ args: ["src/App.tsx", "Dockerfile"] }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+});
+
+describe("extractPathCandidates (free-form strings)", () => {
+	it("preserves v1.3.2 path mentions in arbitrary command strings", () => {
+		expect(extractPathCandidates({ command: "cat src/components/Button.widget" }, "/repo")).toEqual([
+			resolve("/repo/src/components/Button.widget"),
+		]);
+		expect(extractPathCandidates({ cmd: "ls -la src/App.tsx" }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+
+	it("still resolves a structured path key against a workdir in the same record", () => {
+		expect(extractPathCandidates({ cmd: "sed -n 1,5p tests/helper.ts", workdir: "/repo/src", file: "tests/helper.ts" }, "/repo")).toEqual([
 			resolve("/repo/src"),
 			resolve("/repo/src/tests/helper.ts"),
 		]);
 	});
 
-	it("skips flags, plain words, URLs, and line-range suffixes", () => {
-		expect(
-			extractPathCandidates(
-				{ cmd: "rg -n --hidden foo tests/a.ts:10 https://example.com/x.md plain", workdir: "/repo" },
-				"/repo",
-			),
-		).toEqual([resolve("/repo"), resolve("/repo/tests/a.ts")]);
-	});
-
-	it("ignores blank command tokens and blank base keys", () => {
+	it("ignores blank base keys", () => {
 		expect(extractPathCandidates({ command: "   ", workdir: "  " }, "/repo")).toEqual([]);
 	});
 
 	it("does not re-emit a relative workdir as its own child path", () => {
-		expect(extractPathCandidates({ workdir: "src", cmd: "cat helper.ts" }, "/repo")).toEqual([
+		expect(extractPathCandidates({ workdir: "src", path: "helper.ts" }, "/repo")).toEqual([
 			resolve("/repo/src"),
 			resolve("/repo/src/helper.ts"),
 		]);
 	});
+});
 
+describe("extractPathCandidates (nesting and budgets)", () => {
 	it("walks nested records with their base and stops at the depth limit", () => {
 		expect(
 			extractPathCandidates(
 				{
 					details: {
 						cwd: "/repo/src",
-						command: "cat helper.ts",
+						path: "helper.ts",
 						deeper: { ignored: { path: "not-reached.ts" } },
 					},
 				},
@@ -73,16 +100,110 @@ describe("extractPathCandidates (command string tokens)", () => {
 		]);
 	});
 
-	it("enforces the candidate and string-scan budgets", () => {
-		const tokens = Array.from({ length: 20 }, (_, index) => `files/${index}.ts`).join(" ");
-		expect(extractPathCandidates({ command: tokens }, "/repo")).toHaveLength(16);
-		expect(extractPathCandidates({ command: `${"x".repeat(16 * 1024)} files/late.ts` }, "/repo")).toEqual([]);
+	it("enforces the candidate budget", () => {
+		const input = Object.fromEntries(
+			Array.from({ length: 20 }, (_, index) => [`nested${index}`, { path: `files/${index}.ts` }]),
+		);
+		expect(extractPathCandidates(input, "/repo")).toHaveLength(16);
+	});
+});
 
-		const exactPath = "files/exact-limit.ts";
-		const exactLengthCommand = `${"x".repeat(16 * 1024 - exactPath.length - 1)} ${exactPath}`;
-		expect(exactLengthCommand).toHaveLength(16 * 1024);
-		expect(extractPathCandidates({ command: exactLengthCommand }, "/repo")).toEqual([
-			resolve("/repo/files/exact-limit.ts"),
+describe("extractPathCandidates (notebook and bounded compatibility)", () => {
+	it("preserves v1.3.2 unquoted path tokens containing route punctuation", () => {
+		for (const path of ["src/app/[id]/page.tsx", "src/app/(group)/page.tsx", "src/a,b.ts"]) {
+			expect(extractPathCandidates({ cmd: "cat " + path }, "/repo")).toContain(resolve("/repo", path));
+		}
+	});
+
+	it("finds quoted file literals inside notebook expressions", () => {
+		expect(extractPathCandidates({ code: 'text(await Deno.readTextFile("src/App.tsx"));' }, "/repo")).toEqual([resolve("/repo/src/App.tsx")]);
+		expect(extractPathCandidates({ code: "text(await tools.exec_command({cmd:'cat src/App.tsx'}));" }, "/repo")).toEqual([resolve("/repo/src/App.tsx")]);
+	});
+
+	it("keeps quoted paths with spaces as candidates", () => {
+		expect(extractPathCandidates({ code: 'text(await Deno.readTextFile("/repo/my app/Button.tsx"));' }, "/repo")).toEqual(["/repo/my app/Button.tsx"]);
+	});
+
+	it("ignores flags, URLs and bare command words and strips line suffixes", () => {
+		expect(extractPathCandidates({ cmd: "rg -n --hidden plain tests/a.ts:10-20 https://example.com/x.md Dockerfile" }, "/repo")).toEqual([
+			resolve("/repo/tests/a.ts"),
 		]);
+	});
+
+	it("does not scan beyond the per-string size limit", () => {
+		expect(extractPathCandidates({ code: "x".repeat(16 * 1024) + " src/late.ts" }, "/repo")).toEqual([]);
+		const path = "src/boundary.ts";
+		const atLimit = " ".repeat(16 * 1024 - path.length) + path;
+		expect(extractPathCandidates({ code: atLimit }, "/repo")).toEqual([resolve("/repo", path)]);
+	});
+
+	it("limits total free-form text scanned across a single input", () => {
+		const input = { a: "x".repeat(16 * 1024), b: "x".repeat(16 * 1024), c: "x".repeat(16 * 1024), d: "x".repeat(16 * 1024), late: "src/late.ts" };
+		expect(extractPathCandidates(input, "/repo")).toEqual([]);
+	});
+
+	it("limits visited entries even when none produces a candidate", () => {
+		const input = Object.fromEntries(Array.from({ length: 512 }, (_, index) => [String(index), null]));
+		input.path = "src/late.ts";
+		expect(extractPathCandidates(input, "/repo")).toEqual([]);
+	});
+
+	it("terminates on cyclic records and ignores inherited path fields", () => {
+		const input: { self?: unknown; path: string } = { path: "src/App.tsx" };
+		input.self = input;
+		expect(extractPathCandidates(input, "/repo")).toEqual([resolve("/repo/src/App.tsx")]);
+		expect(extractPathCandidates(Object.create({ path: "src/inherited.ts" }), "/repo")).toEqual([]);
+	});
+});
+
+describe("extractPathCandidates (candidate admission)", () => {
+	it("does not let notebook syntax displace later legacy path mentions", () => {
+		const input = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [
+			"code" + index, 'Deno.readTextFile("quoted/' + index + '.ts")',
+		]));
+		input.cmd = "cat legacy/target.ts";
+		expect(extractPathCandidates(input, "/repo")).toEqual([
+			...Array.from({ length: 8 }, (_, index) => resolve("/repo/quoted/" + index + ".ts")),
+			resolve("/repo/legacy/target.ts"),
+		]);
+	});
+
+	it("charges inherited enumeration to the visit budget", () => {
+		let descriptors = 0;
+		const prototype = new Proxy(Object.fromEntries(Array.from({ length: 1000 }, (_, index) => ["field" + index, null])), {
+			getOwnPropertyDescriptor(target, key) {
+				descriptors++;
+				return Object.getOwnPropertyDescriptor(target, key);
+			},
+		});
+		expect(extractPathCandidates(Object.create(prototype), "/repo")).toEqual([]);
+		expect(descriptors).toBeLessThan(1000);
+	});
+});
+
+describe("extractPathCandidates (quoted literals and command values)", () => {
+	it("keeps relative quoted paths with spaces intact", () => {
+		for (const path of ["my app/Button.tsx", "my file.ts"]) {
+			expect(extractPathCandidates({ code: 'Deno.readTextFile("' + path + '")' }, "/repo")).toEqual([
+				resolve("/repo", path),
+			]);
+		}
+	});
+
+	it("scans nested command values even when the executable is path-qualified", () => {
+		expect(extractPathCandidates({ code: "text(await tools.exec_command({cmd:'./reader src/App.tsx'}));" }, "/repo")).toEqual([
+			resolve("/repo/reader"),
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+});
+
+describe("extractPathCandidates (nested shell commands)", () => {
+	it("preserves quoted shell command arguments from v1.3.2", () => {
+		for (const command of ['bash -lc "cat src/App.tsx"', "sh -c './reader src/App.tsx'"]) {
+			const candidates = extractPathCandidates({ command }, "/repo");
+			expect(candidates).toContain(resolve("/repo/src/App.tsx"));
+			expect(candidates).not.toContain(resolve("/repo/cat src/App.tsx"));
+		}
 	});
 });

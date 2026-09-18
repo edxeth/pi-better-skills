@@ -246,7 +246,7 @@ If the running session has more tokens than the target model's `contextWindow`, 
 
 ## Auto-injecting skills with `globs`
 
-Skills with a `globs` field in their frontmatter get injected when a tool touches a matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
+Skills with a `globs` field in their frontmatter get injected when a tool call names a matching file, whatever the tool. You don't need to load the skill manually.
 
 ### Frontmatter format
 
@@ -282,7 +282,7 @@ globs: "Dockerfile*"
 
 ### Deduplication
 
-Skills inject once per turn, not once per file. If you read three `.tsx` files in one turn, matching skills inject on the first read only.
+A skill injects once while its body is in the conversation. If compaction or tree navigation removes it, it can inject again.
 
 ### Supported glob patterns
 
@@ -341,7 +341,7 @@ References expand wherever a skill body enters context:
 
 - **Transitive, cycle-safe.** References of references expand too. One expansion never injects the same skill twice (diamonds collapse).
 - **Referenced skills can set `disable-model-invocation: true`.** Unlike passive `globs` injection, a backticked reference is an explicit author choice, so those skills inject anyway.
-- **Session-wide deduplication.** A referenced skill injects once per session. The memory resets after `/compact`, because compaction can remove the earlier body from the context.
+- **No duplicates.** A referenced skill injects once while its body is in the context; compaction or tree navigation can make it eligible again.
 - **Unresolvable references inject nothing.** `` `/typo` `` stays as written and no block is appended when the name does not match an installed skill.
 - **Dynamic shell placeholders never run in referenced bodies.** The extension neutralizes them with a visible note. This keeps the promise that loaded content already contains command output.
 - **No model/thinking overrides from referenced skills.** Frontmatter `model`/`thinking` only apply to the skill you explicitly load.
