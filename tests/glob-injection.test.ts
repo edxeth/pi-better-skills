@@ -759,6 +759,30 @@ describe("parallel final message delivery", () => {
 });
 
 describe("skill references in multi-block tool results", () => {
+	it("appends a shared referenced child only once when a prepend claims it first", async () => {
+		const parentBody = "---\nname: parent\ndescription: Parent guidance\n---\nParent marker. See \`/child\`.\n";
+		const childBody = "---\nname: child\ndescription: Child guidance\n---\nChild marker.\n";
+		const globbyBody = '---\nname: globby\ndescription: Glob guidance\nglobs: ["**/*.md"]\n---\nGlob marker. See \`/child\`.\n';
+		const project = await setupProject({
+			".pi/skills/parent/SKILL.md": parentBody,
+			".pi/skills/child/SKILL.md": childBody,
+			".pi/skills/globby/SKILL.md": globbyBody,
+		});
+		try {
+			// The direct read of parent also names a .md path, so globby is
+			// prepended in the same plan. Both reference /child: the child
+			// body must be delivered exactly once (nested in the prepend).
+			const skillPath = join(project.root, ".pi/skills/parent/SKILL.md");
+			const result = await deliverToolResult(project, toolResult("read", { path: skillPath }, parentBody));
+			const text = resultText(result);
+			expect(text.split("Child marker.").length - 1).toBe(1);
+			expect(text).toContain("Parent marker.");
+			expect(text).toContain("Glob marker.");
+		} finally {
+			project.cleanup();
+		}
+	});
+
 	it("loads siblings from the skill body after notebook status blocks and deduplicates later reads", async () => {
 		const parentBody = "---\nname: notebook-parent\ndescription: Parent guidance\n---\nParent marker. See `/notebook-child`.\n";
 		const childBody = "---\nname: notebook-child\ndescription: Child guidance\n---\nNotebook child marker.\n";
@@ -776,7 +800,13 @@ describe("skill references in multi-block tool results", () => {
 			];
 			const result = await deliverToolResult(project, first);
 			expect(resultText(result).split("Notebook child marker.").length - 1).toBe(1);
-			expect(resultText(result)).toContain(parentBody);
+			// Issue 9: the body-bearing block is the decorated one; status blocks
+			// stay verbatim and the context lands after the frontmatter.
+			expect(resultText(result)).toContain(
+				"---\nname: notebook-parent\ndescription: Parent guidance\n---\n\n<skill_context>",
+			);
+			expect(resultText(result)).toContain("Parent marker. See `/notebook-child`.");
+			expect(resultText(result).startsWith("Script completed")).toBe(true);
 
 			const second = toolResult("exec", first.input);
 			second.content = [{ type: "text", text: "Script completed" }, { type: "text", text: parentBody }];

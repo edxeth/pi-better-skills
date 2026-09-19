@@ -1,15 +1,105 @@
 import { describe, it, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { cliSkillPaths, projectAgentsSkillRoots, projectSkillRoots, resultConfirmsSkillBody, settingsSkillPaths, skillRecordForFile } from "../index";
+import { dirname, join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { cliSkillPaths, resultConfirmsSkillBody } from "../index";
 
 /**
- * Fresh-session discovery: the input event fires before before_agent_start
- * merges pi's authoritative loaded set, so the extension's own scan must cover
- * CLI --skill paths, settings `skills` arrays, and project .agents/skills
- * ancestors on its own.
+ * Discovery is a canonical bootstrap: DefaultPackageManager.resolve (settings,
+ * packages, default roots, .agents roots, trust gating — what pi itself runs)
+ * plus one loadSkills over the enabled paths. It runs at session_start and
+ * resources_discover only; before_agent_start merges pi's loaded set without
+ * touching the filesystem. The bootstrap tests observe the catalog through the
+ * tool_result enrichment seam.
  */
+
+type TextBlock = { type: "text"; text: string };
+type ToolResultEvent = {
+	type: "tool_result";
+	toolCallId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	content: TextBlock[];
+	isError: boolean;
+};
+type FakeContext = { cwd: string; isProjectTrusted: () => boolean; hasUI: boolean; sessionManager: SessionManager };
+type Handler = (event: unknown, ctx: FakeContext) => unknown | Promise<unknown>;
+
+function makeFakePi(cwd: string, trusted: boolean) {
+	const handlers = new Map<string, Handler[]>();
+	const sessionManager = SessionManager.inMemory(cwd);
+	const ctx: FakeContext = { cwd, isProjectTrusted: () => trusted, hasUI: false, sessionManager };
+	const pi = {
+		on: (event: string, handler: Handler) => {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+		},
+		registerMessageRenderer: () => {},
+		sendMessage: () => {},
+	};
+	return {
+		pi,
+		emit: async (event: string, payload: unknown) => {
+			let result: unknown;
+			for (const handler of handlers.get(event) ?? []) {
+				result = await handler(payload, ctx);
+			}
+			return result;
+		},
+	};
+}
+
+async function setupProject(files: Record<string, string>, trusted = true) {
+	const root = mkdtempSync(join(tmpdir(), "pi-better-skills-discovery-"));
+	for (const [relative, content] of Object.entries(files)) {
+		const full = join(root, relative);
+		mkdirSync(dirname(full), { recursive: true });
+		writeFileSync(full, content, "utf-8");
+	}
+	// Hermetic bootstrap: PI_CODING_AGENT_DIR isolates pi's agent dir
+	// (~/.pi/agent) and HOME isolates the cross-agent ~/.agents/skills dir
+	// the package manager also scans, so discovery never reads the
+	// developer's real global skills, packages, or settings during tests.
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-better-skills-agentdir-"));
+	const homeDir = mkdtempSync(join(tmpdir(), "pi-better-skills-home-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousHome = process.env.HOME;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.HOME = homeDir;
+	const extension = (await import("../index")).default;
+	const { pi, emit } = makeFakePi(root, trusted);
+	(extension as (pi: unknown) => void)(pi);
+	await emit("session_start", {});
+	return {
+		root,
+		emit,
+		readEvent: (skillPath: string, body: string): ToolResultEvent => ({
+			type: "tool_result",
+			toolCallId: "call-1",
+			toolName: "read",
+			input: { path: skillPath },
+			content: [{ type: "text", text: body }],
+			isError: false,
+		}),
+		cleanup: () => {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			rmSync(root, { recursive: true, force: true });
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(homeDir, { recursive: true, force: true });
+		},
+	};
+}
+
+const SKILL = (name: string) => `---
+name: ${name}
+description: Discovery test skill
+---
+
+${name} body marker.
+`;
 
 describe("cliSkillPaths", () => {
 	it("collects --skill <path> and --skill=<path> forms", () => {
@@ -23,63 +113,76 @@ describe("cliSkillPaths", () => {
 	});
 });
 
-describe("settingsSkillPaths", () => {
-	it("resolves relative entries against cwd, matching pi's loader", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-settings-"));
+describe("bootstrap discovery via pi public APIs", () => {
+	it("discovers project .pi/skills through the canonical resolution", async () => {
+		const project = await setupProject({ ".pi/skills/probe/SKILL.md": SKILL("probe") });
 		try {
-			mkdirSync(join(dir, ".pi"));
-			writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ skills: ["/abs/claude-skills", "sub/skills"] }));
-			const paths = settingsSkillPaths(dir, true);
-			expect(paths).toContain("/abs/claude-skills");
-			expect(paths).toContain(join(dir, "sub/skills"));
+			const skillPath = join(project.root, ".pi/skills/probe/SKILL.md");
+			const result = await project.emit("tool_result", project.readEvent(skillPath, SKILL("probe")));
+			const blocks = (result as { content?: TextBlock[] } | undefined)?.content ?? [];
+			expect(blocks[0]?.text).toContain("<skill_context>");
 		} finally {
-			rmSync(dir, { recursive: true, force: true });
+			project.cleanup();
 		}
 	});
 
-	it("skips project settings until the project is trusted", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-settings-"));
+	it("discovers project .agents/skills when trusted", async () => {
+		const project = await setupProject({ ".agents/skills/agents-probe/SKILL.md": SKILL("agents-probe") });
 		try {
-			mkdirSync(join(dir, ".pi"));
-			writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ skills: ["sub/skills"] }));
-			expect(settingsSkillPaths(dir, false)).toEqual([]);
-			expect(settingsSkillPaths(dir, true)).toEqual([join(dir, "sub/skills")]);
+			const skillPath = join(project.root, ".agents/skills/agents-probe/SKILL.md");
+			const result = await project.emit("tool_result", project.readEvent(skillPath, SKILL("agents-probe")));
+			const blocks = (result as { content?: TextBlock[] } | undefined)?.content ?? [];
+			expect(blocks[0]?.text).toContain("<skill_context>");
 		} finally {
-			rmSync(dir, { recursive: true, force: true });
+			project.cleanup();
 		}
 	});
 
-	it("ignores missing settings files", () => {
-		expect(settingsSkillPaths(join(tmpdir(), "definitely-missing-dir"), true)).toEqual([]);
+	it("discovers a settings skills array entry from project settings", async () => {
+		const project = await setupProject({
+			".pi/settings.json": JSON.stringify({ skills: ["extra-skills"] }),
+			"extra-skills/settings-probe/SKILL.md": SKILL("settings-probe"),
+		});
+		try {
+			const skillPath = join(project.root, "extra-skills/settings-probe/SKILL.md");
+			const result = await project.emit("tool_result", project.readEvent(skillPath, SKILL("settings-probe")));
+			const blocks = (result as { content?: TextBlock[] } | undefined)?.content ?? [];
+			expect(blocks[0]?.text).toContain("<skill_context>");
+		} finally {
+			project.cleanup();
+		}
 	});
-});
 
-describe("projectAgentsSkillRoots", () => {
-	it("walks ancestors up to the git root", () => {
-		const roots = projectAgentsSkillRoots(
-			"/repo/a/b",
-			(gitPath) => gitPath === "/repo/.git", // pretend /repo is the git root
+	it("keeps project skills out of the catalog until the project is trusted", async () => {
+		const project = await setupProject(
+			{
+				".pi/skills/probe/SKILL.md": `---
+name: probe
+description: Discovery test skill
+globs: ["**/*.probe"]
+---
+
+probe body marker.
+`,
+				"src/thing.probe": "content",
+			},
+			false,
 		);
-		expect(roots).toEqual(["/repo/a/b/.agents/skills", "/repo/a/.agents/skills", "/repo/.agents/skills"]);
-	});
-
-	it("walks to the filesystem root when there is no repo", () => {
-		const roots = projectAgentsSkillRoots("/tmp/x/y", () => false);
-		expect(roots[0]).toBe("/tmp/x/y/.agents/skills");
-		expect(roots).toContain("/.agents/skills");
-		expect(roots).toHaveLength(4); // /tmp/x/y, /tmp/x, /tmp, /
-	});
-});
-
-describe("projectSkillRoots", () => {
-	it("is empty until the project is trusted", () => {
-	expect(projectSkillRoots("/repo", false)).toEqual([]);
-	});
-
-	it("includes .pi/skills plus .agents/skills ancestors when trusted", () => {
-		const roots = projectSkillRoots("/repo/a", true);
-		expect(roots[0]).toBe("/repo/a/.pi/skills");
-		expect(roots).toContain("/repo/a/.agents/skills");
+		try {
+			// A glob-matching file read must not inject the untrusted skill body.
+			const result = await project.emit("tool_result", {
+				type: "tool_result",
+				toolCallId: "call-1",
+				toolName: "read",
+				input: { path: join(project.root, "src/thing.probe") },
+				content: [{ type: "text", text: "content" }],
+				isError: false,
+			});
+			const blocks = (result as { content?: TextBlock[] } | undefined)?.content ?? [];
+			expect(blocks[0]?.text ?? "content").not.toContain("probe body marker");
+		} finally {
+			project.cleanup();
+		}
 	});
 });
 
@@ -97,22 +200,5 @@ describe("resultConfirmsSkillBody", () => {
 		expect(resultConfirmsSkillBody("stat: /skills/x/SKILL.md 1204 bytes", body)).toBe(false);
 		expect(resultConfirmsSkillBody("echo /skills/x/SKILL.md", body)).toBe(false);
 		expect(resultConfirmsSkillBody("", body)).toBe(false);
-	});
-});
-
-describe("skillRecordForFile", () => {
-	it("requires a description like pi's loader", () => {
-		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-file-"));
-		try {
-			const withDesc = join(dir, "with-desc.md");
-			const withoutDesc = join(dir, "no-desc.md");
-			writeFileSync(withDesc, "---\nname: has-desc\ndescription: yes\n---\nbody");
-			writeFileSync(withoutDesc, "---\nname: no-desc\n---\nbody");
-			expect(skillRecordForFile(withDesc)?.name).toBe("has-desc");
-			expect(skillRecordForFile(withoutDesc)).toBeUndefined();
-			expect(skillRecordForFile(join(dir, "missing.md"))).toBeUndefined();
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
 	});
 });

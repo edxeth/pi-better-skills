@@ -1,206 +1,107 @@
 import { describe, it, expect } from "bun:test";
-import { extractGlobs, extractDisableModelInvocation, matchesGlobs, hasGlobs, hasAutoInjectableGlobs, SkillWithGlobs } from "../globs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { hasAutoInjectableGlobs, hasGlobs, matchesGlobs, skillDocument, type SkillRecord } from "../skill-catalog";
 
 /**
- * Helper to create a minimal skill record for testing.
+ * Glob matching and frontmatter glob extraction. Extraction goes through
+ * skillDocument (pi's YAML parser), so a brace-expansion glob such as
+ * the ts-and-tsx pattern stays one pattern instead of splitting on the
+ * comma inside the braces.
  */
-function skill(name: string, globs?: string[]): SkillWithGlobs {
-	return { name, filePath: `/skills/${name}/SKILL.md`, baseDir: `/skills/${name}`, globs };
+
+function skill(name: string, globs?: string[], disableModelInvocation?: boolean): SkillRecord {
+	return { name, filePath: "/skills/" + name + "/SKILL.md", baseDir: "/skills/" + name, globs, disableModelInvocation };
 }
 
-describe("extractGlobs", () => {
-	it("extracts a YAML array from frontmatter", () => {
-		const content = `---
-name: test-skill
-description: Test
-globs: ["**/*.tsx", "**/*.jsx"]
----
-# Skill content
-`;
-		expect(extractGlobs(content)).toEqual(["**/*.tsx", "**/*.jsx"]);
-	});
-
-	it("extracts a YAML list from frontmatter", () => {
-		const content = `---
-name: test-skill
-description: Test
-globs:
-  - "**/*.tsx"
-  - "**/*.jsx"
----
-# Skill content
-`;
-		expect(extractGlobs(content)).toEqual(["**/*.tsx", "**/*.jsx"]);
-	});
-
-	it("extracts a single string glob", () => {
-		const content = `---
-name: test-skill
-description: Test
-globs: "*.ts"
----
-# Skill content
-`;
-		expect(extractGlobs(content)).toEqual(["*.ts"]);
-	});
-
-	it("returns undefined when no globs field", () => {
-		const content = `---
-name: test-skill
-description: Test
----
-# Skill content
-`;
-		expect(extractGlobs(content)).toBeUndefined();
-	});
-
-	it("returns undefined when no frontmatter", () => {
-		const content = `# Skill without frontmatter`;
-		expect(extractGlobs(content)).toBeUndefined();
-	});
-
-	it("returns undefined for empty globs array", () => {
-		const content = `---
-name: test-skill
-description: Test
-globs: []
----
-# Skill content
-`;
-		expect(extractGlobs(content)).toBeUndefined();
-	});
-});
-
-describe("extractDisableModelInvocation", () => {
-	it("returns true when disable-model-invocation is true", () => {
-		const content = `---
-name: test-skill
-description: Test
-disable-model-invocation: true
-globs: ["**/*.tsx"]
----
-# Skill content
-`;
-		expect(extractDisableModelInvocation(content)).toBe(true);
-	});
-});
-
-describe("hasGlobs", () => {
-	it("returns true when globs are present", () => {
-		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: ["*.ts"] };
-		expect(hasGlobs(skill)).toBe(true);
-	});
-
-	it("returns false when globs is undefined", () => {
-		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path" };
-		expect(hasGlobs(skill)).toBe(false);
-	});
-
-	it("returns false when globs is empty array", () => {
-		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: [] };
-		expect(hasGlobs(skill)).toBe(false);
-	});
-});
-
-describe("hasAutoInjectableGlobs", () => {
-	it("returns true for enabled skills with globs", () => {
-		const skill = { name: "test", filePath: "/path/SKILL.md", baseDir: "/path", globs: ["*.ts"] };
-		expect(hasAutoInjectableGlobs(skill)).toBe(true);
-	});
-
-	it("returns false for disabled model-invocation skills even when globs are present", () => {
-		const skill = {
-			name: "test",
-			filePath: "/path/SKILL.md",
-			baseDir: "/path",
-			globs: ["*.ts"],
-			disableModelInvocation: true,
-		};
-		expect(hasAutoInjectableGlobs(skill)).toBe(false);
-	});
-});
-
 describe("matchesGlobs", () => {
-	const globs = ["**/*.tsx", "**/*.jsx", "**/*.vue"];
-
-	it("matches a file path against globs", () => {
-		expect(matchesGlobs("/project/src/Component.tsx", globs)).toBe(true);
+	it("matches paths against configured globs", () => {
+		expect(matchesGlobs("src/Button.tsx", ["**/*.tsx"])).toBe(true);
+		expect(matchesGlobs("src/Button.vue", ["**/*.tsx"])).toBe(false);
 	});
 
-	it("matches .jsx files", () => {
-		expect(matchesGlobs("/project/src/Component.jsx", globs)).toBe(true);
+	it("matches basename patterns and dotfiles", () => {
+		expect(matchesGlobs("any/dir/Dockerfile", ["Dockerfile"])).toBe(true);
+		expect(matchesGlobs("dir/.env", ["**/.env"])).toBe(true);
 	});
 
-	it("matches .vue files", () => {
-		expect(matchesGlobs("/project/src/Component.vue", globs)).toBe(true);
-	});
-
-	it("does not match .css files", () => {
-		expect(matchesGlobs("/project/src/styles.css", globs)).toBe(false);
-	});
-
-	it("does not match .ts files without 'x'", () => {
-		expect(matchesGlobs("/project/src/utils.ts", globs)).toBe(false);
-	});
-
-	it("matches nested paths", () => {
-		expect(matchesGlobs("/project/src/components/deep/nested/Button.tsx", globs)).toBe(true);
-	});
-
-	it("returns false for empty globs", () => {
-		expect(matchesGlobs("/project/src/Component.tsx", [])).toBe(false);
-	});
-
-	it("matches using exact file name glob", () => {
-		const exactGlobs = ["Dockerfile", "*.env"];
-		expect(matchesGlobs("/project/Dockerfile", exactGlobs)).toBe(true);
-	});
-
-	it("matches glob without directory prefix", () => {
-		const noDirGlobs = ["*.tsx"];
-		expect(matchesGlobs("/project/src/Component.tsx", noDirGlobs)).toBe(true);
+	it("returns false for an empty glob list", () => {
+		expect(matchesGlobs("src/a.ts", [])).toBe(false);
 	});
 });
 
-describe("integration: full pipeline", () => {
-	const lawsOfUxFrontmatter = `---
-name: laws-of-ux
-description: UX psychology rules
-globs: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.html"]
----
-# Laws of UX
-`;
-
-	it("extracts globs from a real skill frontmatter", () => {
-		const globs = extractGlobs(lawsOfUxFrontmatter);
-		expect(globs).toEqual(["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.html"]);
+describe("hasGlobs / hasAutoInjectableGlobs", () => {
+	it("requires a non-empty glob list", () => {
+		expect(hasGlobs(skill("a"))).toBe(false);
+		expect(hasGlobs(skill("a", undefined))).toBe(false);
+		expect(hasGlobs(skill("a", ["**/*.ts"]))).toBe(true);
 	});
 
-	it("a .tsx file matches the extracted globs", () => {
-		const globs = extractGlobs(lawsOfUxFrontmatter)!;
-		expect(hasGlobs(skill("laws-of-ux", globs))).toBe(true);
-		expect(matchesGlobs("/project/src/components/Button.tsx", globs)).toBe(true);
+	it("auto-injection requires globs and model invocation allowed", () => {
+		expect(hasAutoInjectableGlobs(skill("a", ["**/*.ts"], true))).toBe(false);
+		expect(hasAutoInjectableGlobs(skill("a", ["**/*.ts"], false))).toBe(true);
+		expect(hasAutoInjectableGlobs(skill("a", undefined, false))).toBe(false);
+	});
+});
+
+describe("skillDocument glob extraction", () => {
+	it("keeps a brace-expansion glob as one pattern instead of splitting on the comma", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-globs-"));
+		try {
+			const skillPath = join(dir, "brace", "SKILL.md");
+			mkdirSync(join(dir, "brace"), { recursive: true });
+			writeFileSync(
+				skillPath,
+				["---", "name: brace", "description: Brace globs", 'globs: ["**/*.{ts,tsx}"]', "---", "", "Body.", ""].join("\n"),
+			);
+			const doc = skillDocument(skillPath);
+			expect(doc?.globs).toEqual(["**/*.{ts,tsx}"]);
+			expect(matchesGlobs("src/components/Button.tsx", doc?.globs ?? [])).toBe(true);
+			expect(matchesGlobs("src/components/Button.vue", doc?.globs ?? [])).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
-	it("a .css file does not match the extracted globs", () => {
-		const globs = extractGlobs(lawsOfUxFrontmatter)!;
-		expect(matchesGlobs("/project/src/styles.css", globs)).toBe(false);
+	it("reads list-form, quoted single, and disable-model-invocation frontmatter", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-globs-"));
+		try {
+			const listPath = join(dir, "list", "SKILL.md");
+			const singlePath = join(dir, "single", "SKILL.md");
+			mkdirSync(join(dir, "list"), { recursive: true });
+			mkdirSync(join(dir, "single"), { recursive: true });
+			writeFileSync(
+				listPath,
+				["---", "name: list", "description: List globs", "globs:", '  - "**/*.tsx"', '  - "src/**"', "---", "", "Body.", ""].join("\n"),
+			);
+			writeFileSync(
+				singlePath,
+				["---", "name: single", "description: Single glob", "globs: \"*.ts\"", "disable-model-invocation: true", "---", "", "Body.", ""].join("\n"),
+			);
+			expect(skillDocument(listPath)?.globs).toEqual(["**/*.tsx", "src/**"]);
+			const single = skillDocument(singlePath);
+			expect(single?.globs).toEqual(["*.ts"]);
+			expect(single?.disableModelInvocation).toBe(true);
+			expect(hasAutoInjectableGlobs({ ...skill("single"), globs: single?.globs, disableModelInvocation: single?.disableModelInvocation })).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
-	it("the design-craft skill globs match various file types", () => {
-		const frontmatter = `---
-name: design-craft
-globs: ["**/*.tsx", "**/*.jsx", "**/*.vue", "**/*.svelte", "**/*.css", "**/*.scss"]
----
-`;
-		const globs = extractGlobs(frontmatter)!;
-		expect(matchesGlobs("Component.tsx", globs)).toBe(true);
-		expect(matchesGlobs("Component.jsx", globs)).toBe(true);
-		expect(matchesGlobs("Component.vue", globs)).toBe(true);
-		expect(matchesGlobs("Component.svelte", globs)).toBe(true);
-		expect(matchesGlobs("styles.css", globs)).toBe(true);
-		expect(matchesGlobs("styles.scss", globs)).toBe(true);
-		expect(matchesGlobs("Component.ts", globs)).toBe(false);
-		expect(matchesGlobs("types.ts", globs)).toBe(false);
+	it("yields no globs when frontmatter is missing or invalid YAML", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-better-skills-globs-"));
+		try {
+			const nonePath = join(dir, "none", "SKILL.md");
+			const invalidPath = join(dir, "invalid", "SKILL.md");
+			mkdirSync(join(dir, "none"), { recursive: true });
+			mkdirSync(join(dir, "invalid"), { recursive: true });
+			writeFileSync(nonePath, ["---", "name: none", "description: No globs", "---", "", "Body.", ""].join("\n"));
+			writeFileSync(invalidPath, ["---", "name: invalid", "description: Invalid", "globs: *.ts", "---", "", "Body.", ""].join("\n"));
+			expect(skillDocument(nonePath)?.globs).toBeUndefined();
+			expect(skillDocument(invalidPath)).toBeUndefined();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
