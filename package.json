@@ -32,8 +32,12 @@
   "dependencies": {
     "picomatch": "^4.0.4"
   },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.0",
+    "@earendil-works/pi-tui": ">=0.87.0"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.0",
     "@earendil-works/pi-tui": "*"
   }
 }

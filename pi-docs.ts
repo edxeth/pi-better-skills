@@ -13,7 +13,12 @@ export const PI_DOCS_SKILL_NAME = "pi-docs";
 
 const BLOCK_HEADER =
 	"Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):";
-const BLOCK_START_ANCHOR = `\n\n${BLOCK_HEADER}`;
+/** Flat prompts (pi < 0.87) blank-line join the block to the previous section. */
+const FLAT_BLOCK_START_ANCHOR = `\n\n${BLOCK_HEADER}`;
+/** pi >= 0.87 wraps each prompt section in a <name> tag; the block sits inside <docs>. */
+const DOCS_SECTION_OPEN = "<docs>\n";
+const DOCS_SECTION_START_ANCHOR = `${DOCS_SECTION_OPEN}${BLOCK_HEADER}`;
+const DOCS_SECTION_CLOSE = "\n</docs>";
 const FIRST_BULLET_PREFIX = "- Main documentation: ";
 /** Positive bound on the bullet run: pi's block has 7; a longer run means the anchors drifted. */
 const MAX_BLOCK_BULLETS = 32;
@@ -36,22 +41,47 @@ function findPiDocsBulletRunEnd(lines: readonly string[]): number | undefined {
  * Detects pi's built-in documentation block and removes it from the prompt.
  * Structural, not verbatim: anchors on the header line and the first bullet
  * label, then consumes the bullet run regardless of wording inside bullets.
+ * Handles both prompt shapes: pi < 0.87 blank-line joins the block to the
+ * previous section, while pi >= 0.87 wraps it in a <docs> section tag (the
+ * whole section is removed so no empty wrapper is left behind).
  * Returns undefined (fail-open) whenever the anchors do not match, so prompt
  * drift degrades to stock pi rather than a mangled prompt.
  */
 export function stripPiDocsBlock(systemPrompt: string): { prompt: string; block: string } | undefined {
-	const start = systemPrompt.indexOf(BLOCK_START_ANCHOR);
-	if (start < 0) return undefined;
 
-	const blockStart = start + BLOCK_START_ANCHOR.length - BLOCK_HEADER.length;
-	const lines = systemPrompt.slice(blockStart).split("\n");
+	const flatStart = systemPrompt.indexOf(FLAT_BLOCK_START_ANCHOR);
+	const sectionStart = systemPrompt.indexOf(DOCS_SECTION_START_ANCHOR);
+	if (flatStart < 0 && sectionStart < 0) return undefined;
+
+	// A prompt carries only one of the two shapes; prefer whichever matches first.
+	const sectionWrapped = sectionStart >= 0 && (flatStart < 0 || sectionStart < flatStart);
+	const headerIndex = sectionWrapped
+		? sectionStart + DOCS_SECTION_START_ANCHOR.length - BLOCK_HEADER.length
+		: flatStart + FLAT_BLOCK_START_ANCHOR.length - BLOCK_HEADER.length;
+
+	const lines = systemPrompt.slice(headerIndex).split("\n");
 	const end = findPiDocsBulletRunEnd(lines);
 	if (end === undefined) return undefined;
 
 	const consumed = lines.slice(0, end).reduce((length, line) => length + line.length + 1, 0);
-	const block = systemPrompt.slice(blockStart, blockStart + consumed).replace(/\n$/, "");
-	const tail = systemPrompt.slice(blockStart + consumed).replace(/^\n/, "");
-	return { prompt: `${systemPrompt.slice(0, start)}\n\n${tail}`, block };
+	const block = systemPrompt.slice(headerIndex, headerIndex + consumed).replace(/\n$/, "");
+
+	if (!sectionWrapped) {
+		const tail = systemPrompt.slice(headerIndex + consumed).replace(/^\n/, "");
+		return { prompt: `${systemPrompt.slice(0, headerIndex - 2)}\n\n${tail}`, block };
+	}
+	// The closing tag must directly follow the bullet run; anything else means
+	// the section layout drifted, so fail open.
+	const closeIndex = headerIndex + consumed - 1;
+	if (!systemPrompt.startsWith(DOCS_SECTION_CLOSE, closeIndex)) return undefined;
+	return { prompt: exciseJoinedRange(systemPrompt, sectionStart, closeIndex + DOCS_SECTION_CLOSE.length), block };
+}
+
+/** Remove [start, end) plus one adjacent blank-line join, so neighboring prompt sections re-join cleanly. */
+function exciseJoinedRange(text: string, start: number, end: number): string {
+	if (text.startsWith("\n\n", end)) return text.slice(0, start) + text.slice(end + 2);
+	if (text.startsWith("\n\n", start - 2)) return text.slice(0, start - 2) + text.slice(end);
+	return text.slice(0, start) + text.slice(end);
 }
 
 /** Authored once, deliberately generic: it must not enumerate doc topics that pi may add or remove. */
@@ -210,6 +240,14 @@ function hasLoadedPiDocsSkill(options: PiDocsStripOptions, agentDir: string): bo
 }
 
 function stripCapturedPiDocsBlock(systemPrompt: string, block: string): string | undefined {
+	// pi >= 0.87: remove the whole <docs> section so no empty wrapper remains.
+	const section = `${DOCS_SECTION_OPEN}${block}${DOCS_SECTION_CLOSE}`;
+	const sectionStart = systemPrompt.indexOf(section);
+	if (sectionStart >= 0) {
+		return exciseJoinedRange(systemPrompt, sectionStart, sectionStart + section.length);
+	}
+
+	// Flat pi: the block is blank-line joined to its neighbors; drop it plus one join.
 	const anchor = `\n\n${block}`;
 	const start = systemPrompt.indexOf(anchor);
 	if (start < 0) return undefined;

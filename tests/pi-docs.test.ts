@@ -15,6 +15,11 @@ function promptWithBlock(block: string): string {
 	return `You are an expert coding assistant operating inside pi.\n\nGuidelines:\n- Be concise in your responses\n\n${block}\n\nCurrent working directory: /tmp`;
 }
 
+/** pi >= 0.87 renders the prompt as <name>-tagged sections joined by blank lines (dist/core/system-prompt.js). */
+function promptWithDocsSection(block: string): string {
+	return `<rules>\n- Be concise in your responses\n</rules>\n\n<docs>\n${block}\n</docs>\n\n<project_context>\nUse tools per repo rules.\n</project_context>`;
+}
+
 describe("stripPiDocsBlock", () => {
 	it("returns undefined when the prompt has no pi-docs block", () => {
 		expect(stripPiDocsBlock("Guidelines:\n- Be concise\n\nCurrent working directory: /tmp")).toBeUndefined();
@@ -129,6 +134,103 @@ describe("syncPiDocsSkillFile", () => {
 			expect(readFileSync(path, "utf8")).toContain("New bullet appended by a pi update");
 		} finally {
 			rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("pi >= 0.87 section-wrapped prompts", () => {
+	it("captures the block and removes the whole <docs> section, re-joining neighbors", () => {
+		const result = stripPiDocsBlock(promptWithDocsSection(REAL_BLOCK));
+		expect(result).toBeDefined();
+		expect(result!.block).toBe(REAL_BLOCK);
+		expect(result!.prompt).toBe(
+			"<rules>\n- Be concise in your responses\n</rules>\n\n<project_context>\nUse tools per repo rules.\n</project_context>",
+		);
+	});
+
+	it("removes the preceding blank line when <docs> is the final section", () => {
+		const prompt = `<rules>\n- Be concise\n</rules>\n\n<docs>\n${REAL_BLOCK}\n</docs>`;
+		const result = stripPiDocsBlock(prompt);
+		expect(result?.block).toBe(REAL_BLOCK);
+		expect(result?.prompt).toBe("<rules>\n- Be concise\n</rules>");
+	});
+
+	it("fails open when the close tag does not directly follow the bullet run", () => {
+		const drifted = promptWithDocsSection(REAL_BLOCK).replace("</docs>", "\n</docs>");
+		expect(stripPiDocsBlock(drifted)).toBeUndefined();
+	});
+
+	it("still strips when pi rewords or appends bullets inside the section", () => {
+		const evolved = REAL_BLOCK.replace("- When working on pi topics", "- When building pi things") +
+			"\n- New bullet about docs/widgets.md and its cross-references";
+		const result = stripPiDocsBlock(promptWithDocsSection(evolved));
+		expect(result?.block).toBe(evolved);
+		expect(result?.prompt).not.toContain("<docs>");
+	});
+
+	it("registration and before_agent_start strip remove the section end-to-end", async () => {
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-sec-e2e-"));
+		try {
+			const stock = promptWithDocsSection(REAL_BLOCK);
+			expect(piDocsSkillRegistration(stock, agentDir)).toBeDefined();
+			const loaded = [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }];
+			const stripped = applyPiDocsStrip(stock, { skills: loaded }, agentDir);
+			expect(stripped).toBeDefined();
+			expect(stripped!).not.toContain("<docs>");
+			expect(stripped!).not.toContain("Pi documentation (read only");
+			expect(stripped!).toContain("<project_context>");
+		} finally {
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("extension wiring registers the skill and strips the section through both handlers", async () => {
+		const { default: registerExtension } = await import("../index");
+		const { piDocsSkillFilePath } = await import("../pi-docs");
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		const extension = {
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				handlers.set(event, handler);
+			},
+			registerMessageRenderer() {},
+		};
+		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-wiring-sec-agent-"));
+		const cwd = mkdtempSync(join(tmpdir(), "pi-docs-wiring-sec-cwd-"));
+		const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const stock = promptWithDocsSection(REAL_BLOCK);
+		try {
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			registerExtension(extension as never);
+			const context = {
+				cwd,
+				isProjectTrusted: () => false,
+				getSystemPrompt: () => stock,
+			};
+			const registration = await handlers.get("resources_discover")?.({}, context);
+			expect(registration).toEqual({ skillPaths: [join(agentDir, "cache", "pi-better-skills", "pi-docs")] });
+			const result = await handlers.get("before_agent_start")?.(
+				{
+					systemPrompt: stock,
+					systemPromptOptions: { skills: [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }] },
+				},
+				context,
+			);
+			const strippedPrompt = (result as { systemPrompt: string }).systemPrompt;
+			expect(strippedPrompt).not.toContain("<docs>");
+			expect(strippedPrompt).not.toContain("Pi documentation (read only");
+			expect(strippedPrompt).toContain("<agent_skills>");
+		} finally {
+			if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 });
