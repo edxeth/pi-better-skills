@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { describe, expect, it } from "bun:test";
-import { extractPathCandidates } from "../tool-paths";
+import { extractPathCandidates } from "../src/tool-paths";
 
 describe("extractPathCandidates (structured keys)", () => {
 	it("resolves a relative path key against the base dir", () => {

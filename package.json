@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "bun test",
-    "build": "bun build index.ts --target=node --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --outdir=."
+    "build": "bun build src/index.ts --target=node --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --outdir=."
   },
   "repository": {
     "type": "git",
@@ -19,7 +19,7 @@
   ],
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.ts"
     ]
   },
   "author": "",

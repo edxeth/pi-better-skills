@@ -30,7 +30,7 @@ type FakeContext = {
 type Handler = (event: unknown, ctx: FakeContext) => unknown | Promise<unknown>;
 
 async function loadExtension() {
-	return (await import("../index")).default;
+	return (await import("../src/index")).default;
 }
 
 function makeFakePi(cwd: string) {

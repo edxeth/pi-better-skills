@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { cliSkillPaths, resultConfirmsSkillBody } from "../index";
+import { cliSkillPaths, resultConfirmsSkillBody } from "../src/index";
 
 /**
  * Discovery is a canonical bootstrap: DefaultPackageManager.resolve (settings,
@@ -66,7 +66,7 @@ async function setupProject(files: Record<string, string>, trusted = true) {
 	const previousHome = process.env.HOME;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.HOME = homeDir;
-	const extension = (await import("../index")).default;
+	const extension = (await import("../src/index")).default;
 	const { pi, emit } = makeFakePi(root, trusted);
 	(extension as (pi: unknown) => void)(pi);
 	await emit("session_start", {});

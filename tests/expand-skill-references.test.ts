@@ -8,8 +8,8 @@ import {
 	hasResolvableReference,
 	type RefDeps,
 	type SkillRefRecord,
-} from "../skill-refs";
-import { commitRefExpansion, type InlineSkillDisplay } from "../index";
+} from "../src/skill-refs";
+import { commitRefExpansion, type InlineSkillDisplay } from "../src/index";
 
 /**
  * Backticked `/name` references inside a SKILL.md body expand transitively:

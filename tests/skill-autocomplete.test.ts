@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import type { AutocompleteProvider } from "@earendil-works/pi-tui";
-import { setupSkillAutocomplete, type SkillAutocompleteSkill } from "../skill-autocomplete";
+import { setupSkillAutocomplete, type SkillAutocompleteSkill } from "../src/skill-autocomplete";
 
 /**
  * `setupSkillAutocomplete` installs two things on `ctx.ui`:

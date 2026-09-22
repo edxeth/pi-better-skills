@@ -5,7 +5,7 @@ import {
 	isOrdinarySingleLeadingSkillCommand,
 	planInlineSkillDelivery,
 	type InlineSkillRef,
-} from "../index";
+} from "../src/index";
 
 /**
  * `extractInlineSkillDisplays` lets one message reference multiple skills without

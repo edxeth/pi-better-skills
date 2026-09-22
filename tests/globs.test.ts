@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hasAutoInjectableGlobs, hasGlobs, matchesGlobs, skillDocument, type SkillRecord } from "../skill-catalog";
+import { hasAutoInjectableGlobs, hasGlobs, matchesGlobs, skillDocument, type SkillRecord } from "../src/skill-catalog";
 
 /**
  * Glob matching and frontmatter glob extraction. Extraction goes through

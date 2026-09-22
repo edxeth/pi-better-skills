@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { cliSkillsOnly } from "../index";
+import { cliSkillsOnly } from "../src/index";
 
 /**
  * Issue #9 regressions: three confirmed defects.
@@ -154,7 +154,7 @@ async function setupProject(files: Record<string, string>, { argv }: { argv?: st
 	const previousHome = process.env.HOME;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.HOME = homeDir;
-	const extension = (await import("../index")).default;
+	const extension = (await import("../src/index")).default;
 	const { pi, ctx, calls, emit } = makeFakePi(root);
 	(extension as (pi: unknown) => void)(pi);
 	await emit("session_start", {});
@@ -352,7 +352,7 @@ describe("defect 1: --no-skills stops non-CLI skills", () => {
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.HOME = homeDir;
 		try {
-			const extension = (await import("../index")).default;
+			const extension = (await import("../src/index")).default;
 			const { pi, calls, emit } = makeFakePi(root);
 			(extension as (pi: unknown) => void)(pi);
 			await emit("session_start", {});

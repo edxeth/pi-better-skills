@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { stripPiDocsBlock } from "../pi-docs";
+import { stripPiDocsBlock } from "../src/pi-docs";
 
 /** Mirrors pi core's built-in block (dist/core/system-prompt.js) — independent source of truth. */
 const REAL_BLOCK = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
@@ -98,7 +98,7 @@ describe("stripPiDocsBlock drift tolerance", () => {
 
 describe("renderPiDocsSkillMd", () => {
 	it("wraps the captured block in valid frontmatter with the inherited body", async () => {
-		const { renderPiDocsSkillMd, PI_DOCS_SKILL_NAME } = await import("../pi-docs");
+		const { renderPiDocsSkillMd, PI_DOCS_SKILL_NAME } = await import("../src/pi-docs");
 		const md = renderPiDocsSkillMd(REAL_BLOCK);
 		expect(md.startsWith("---\n")).toBe(true);
 		expect(md).toContain(`name: ${PI_DOCS_SKILL_NAME}`);
@@ -114,7 +114,7 @@ describe("renderPiDocsSkillMd", () => {
 
 describe("syncPiDocsSkillFile", () => {
 	it("writes the skill on first call, then skips identical content, then updates on change", async () => {
-		const { syncPiDocsSkillFile, piDocsSkillDirPath } = await import("../pi-docs");
+		const { syncPiDocsSkillFile, piDocsSkillDirPath } = await import("../src/pi-docs");
 		const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -169,7 +169,7 @@ describe("pi >= 0.87 section-wrapped prompts", () => {
 	});
 
 	it("registration and before_agent_start strip remove the section end-to-end", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -189,8 +189,8 @@ describe("pi >= 0.87 section-wrapped prompts", () => {
 	});
 
 	it("extension wiring registers the skill and strips the section through both handlers", async () => {
-		const { default: registerExtension } = await import("../index");
-		const { piDocsSkillFilePath } = await import("../pi-docs");
+		const { default: registerExtension } = await import("../src/index");
+		const { piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -237,7 +237,7 @@ describe("pi >= 0.87 section-wrapped prompts", () => {
 
 describe("piDocsSkillFilePath", () => {
 	it("returns the generated SKILL.md path beneath the private cache", async () => {
-		const { piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillFilePath } = await import("../src/pi-docs");
 		const agentDir = "/tmp/pi-docs-path-agent";
 		expect(piDocsSkillFilePath(agentDir)).toBe(`${agentDir}/cache/pi-better-skills/pi-docs/SKILL.md`);
 	});
@@ -245,7 +245,7 @@ describe("piDocsSkillFilePath", () => {
 
 describe("piDocsFeatureEnabled", () => {
 	it("is on by default and opts out via PI_BETTER_SKILLS_NO_PI_DOCS", async () => {
-		const { piDocsFeatureEnabled } = await import("../pi-docs");
+		const { piDocsFeatureEnabled } = await import("../src/pi-docs");
 		expect(piDocsFeatureEnabled({})).toBe(true);
 		expect(piDocsFeatureEnabled({ PI_BETTER_SKILLS_NO_PI_DOCS: "" })).toBe(true);
 		expect(piDocsFeatureEnabled({ PI_BETTER_SKILLS_NO_PI_DOCS: "0" })).toBe(true);
@@ -260,7 +260,7 @@ describe("piDocsFeatureEnabled", () => {
 
 describe("piDocsSkillRegistration", () => {
 	it("registers and syncs only when the feature is on and the block is present", async () => {
-		const { piDocsSkillRegistration } = await import("../pi-docs");
+		const { piDocsSkillRegistration } = await import("../src/pi-docs");
 		const { mkdtempSync, existsSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -286,7 +286,7 @@ describe("piDocsSkillRegistration", () => {
 	});
 
 	it("emits precise debug diagnostics for success, sync failure, and anchor rejection", async () => {
-		const { piDocsSkillRegistration, piDocsSkillDirPath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, piDocsSkillDirPath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -325,7 +325,7 @@ describe("piDocsSkillRegistration", () => {
 
 describe("pi-docs gate integrity (review findings)", () => {
 	it("real layout strips: no blank line before Current working directory", async () => {
-		const { stripPiDocsBlock } = await import("../pi-docs");
+		const { stripPiDocsBlock } = await import("../src/pi-docs");
 		const realLayout = `Guidelines:\n- Be concise\n\n${REAL_BLOCK}\nCurrent working directory: /tmp`;
 		const result = stripPiDocsBlock(realLayout);
 		expect(result).toBeDefined();
@@ -334,12 +334,12 @@ describe("pi-docs gate integrity (review findings)", () => {
 	});
 
 	it("returns undefined when the prompt starts with the block (no \\n\\n anchor)", async () => {
-		const { stripPiDocsBlock } = await import("../pi-docs");
+		const { stripPiDocsBlock } = await import("../src/pi-docs");
 		expect(stripPiDocsBlock(`${REAL_BLOCK}\n\nNext section`)).toBeUndefined();
 	});
 
 	it("registration fails open on unwritable agentDir", async () => {
-		const { piDocsSkillRegistration } = await import("../pi-docs");
+		const { piDocsSkillRegistration } = await import("../src/pi-docs");
 		const { mkdtempSync, chmodSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -354,7 +354,7 @@ describe("pi-docs gate integrity (review findings)", () => {
 	});
 
 	it("registration honors --no-skills", async () => {
-		const { piDocsSkillRegistration } = await import("../pi-docs");
+		const { piDocsSkillRegistration } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -371,7 +371,7 @@ describe("pi-docs gate integrity (review findings)", () => {
 
 describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () => {
 	it("strips only when our skill is the loaded one at our path and read is active", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -426,7 +426,7 @@ describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () =
 	});
 
 	it("writes the strip-time prompt diagnostic only in debug mode", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, existsSync, readFileSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -465,7 +465,7 @@ describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () =
 	});
 
 	it("stays stock when the generated skill is not loaded, including in debug mode", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -492,7 +492,7 @@ describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () =
 	});
 
 	it("requires a current capture and preserves meaningful content around it", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -510,7 +510,7 @@ describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () =
 	});
 
 	it("does not strip a prompt when discovery captured nothing", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const agentDir = "/tmp/pi-docs-no-capture-agent";
 		expect(piDocsSkillRegistration("no block here", agentDir)).toBeUndefined();
 		expect(
@@ -523,8 +523,8 @@ describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () =
 
 describe("pi-docs extension wiring", () => {
 	it("registers the generated skill and strips through pi's two event handlers", async () => {
-		const { default: registerExtension } = await import("../index");
-		const { piDocsSkillFilePath } = await import("../pi-docs");
+		const { default: registerExtension } = await import("../src/index");
+		const { piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
@@ -580,7 +580,7 @@ describe("pi-docs extension wiring", () => {
 
 describe("stale capture cannot outlive a failed discovery pass", () => {
 	it("a drifted discovery clears capture so the strip stands down even if the skill stays loaded", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../pi-docs");
+		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
