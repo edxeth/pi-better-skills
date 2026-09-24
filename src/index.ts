@@ -3,11 +3,12 @@ import { SkillInvocationMessageComponent } from "@earendil-works/pi-coding-agent
 import { Container, Spacer } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { applyPiDocsStrip, piDocsSkillRegistration } from "./pi-docs";
+import { registerAgentSkillsPrompt } from "./agent-skills-prompt";
+import { registerPiDocsRequestStrip } from "./pi-docs";
 import { createSkillCatalog, cwdPathExists, skillDocument, substitutePiPathVars } from "./skill-catalog";
 import { createSkillResidency } from "./skill-residency";
 import { createSkillDelivery, insertSkillContext, type DeliveryEvent } from "./skill-delivery";
-import { collectSkillReferences, hasResolvableReference, type RefDeps } from "./skill-refs";
+import { collectSkillReferences, hasResolvableReference, neutralizeDynamicPlaceholders, type RefDeps } from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
 
 export { cliSkillPaths, cliSkillsOnly, resultConfirmsSkillBody } from "./skill-catalog";
@@ -151,7 +152,7 @@ export function planInlineSkillDelivery(
 }
 
 /**
- * Return whether pi core can handle this single leading skill command unchanged.
+ * Return whether a prompt uses pi core's single-leading-skill grammar.
  *
  * @param text - The original user prompt.
  * @param skills - The resolvable skills extracted from the prompt.
@@ -508,10 +509,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	// Multi-skill prompts are handled entirely by the extension so both the TUI
 	// and the LLM see: skill rows first, cleaned user prompt second. Ordinary
-	// single leading `/skill:name` commands still fall through to pi core —
-	// unless the skill composes others via backticked `/name` references, in
-	// which case the extension owns the whole expansion so parents and their
-	// referenced skills share one delivery plan.
+	// single leading `/skill:name` commands retain core's single-block layout,
+	// but include the same saved guidance as tool reads. Composite skills use
+	// the shared delivery plan so parents and referenced skills travel together.
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return; // don't rewrite extension-injected text
 		const result = extractInlineSkillDisplays(
@@ -522,7 +522,8 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				// such tokens verbatim instead of injecting an empty block.
 				const body = skillDocument(skill.filePath)?.body;
 				if (body === undefined) throw new Error("unreadable skill body");
-				return body;
+				// Commands load instructions without executing skill-authored shell code.
+				return neutralizeDynamicPlaceholders(body);
 			},
 			// Wrap the body with the same <skill_context> block the extension injects
 			// when a SKILL.md is read, so relative-path resolution applies to these
@@ -532,9 +533,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		);
 		if (!result) return;
 		if (isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) {
-			// No resolvable references -> keep pi core's ordinary single-skill expansion.
+			// Keep core's layout without letting its expansion bypass the guidance.
 			if (!hasResolvableReference(result.skills[0].content, (name) => catalog.skills.get(name))) {
-				return;
+				return { action: "transform" as const, text: inlineSkillsIntoText(result.text, result.skills) };
 			}
 		}
 
@@ -552,40 +553,19 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		return { action: "transform" as const, text };
 	});
 
+	const discoverPiDocsSkill = registerPiDocsRequestStrip(pi);
+	// General skill guidance rides in the system prompt of every request; the
+	// per-skill blocks stay dirs-only (skill-delivery.ts skillContextBlock).
+	registerAgentSkillsPrompt(pi);
 	pi.on("resources_discover", async (_event, ctx) => {
 		await catalog.bootstrap(ctx.cwd, ctx.isProjectTrusted());
-		return piDocsSkillRegistration(ctx.getSystemPrompt());
+		return discoverPiDocsSkill(ctx.getSystemPrompt());
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
 		catalog.mergeLoaded(loaded);
 		if (sessionInitialized) residency.reconcile(ctx);
-
-		let basePrompt = event.systemPrompt;
-		const strippedPrompt = applyPiDocsStrip(basePrompt, {
-			skills: loaded,
-			selectedTools: event.systemPromptOptions?.selectedTools,
-		});
-		if (strippedPrompt !== undefined) basePrompt = strippedPrompt;
-
-		return {
-			systemPrompt:
-				basePrompt +
-				`\n\n<agent_skills>
-  <path_policy>
-    Relative file references in an active SKILL.md normally resolve from that skill's directory when they exist there.
-    Plain workspace commands like \`git status\` and \`bun test\` usually run in the workspace unless instructed otherwise.
-    Use $PI_SKILL_DIR/path for explicit bundled skill files.
-    Use $PI_WORKSPACE/path for explicit workspace/project files.
-    Absolute paths are exact and should not be reinterpreted.
-  </path_policy>
-  <dynamic_skill_shell>
-    Dynamic SKILL.md shell placeholders receive PI_SKILL_DIR and PI_WORKSPACE.
-    If a SKILL.md contains dynamic shell placeholders like !\`command\` or fenced \`\`\`! blocks, the loaded/read skill content already contains their output; do not run those commands again unless the user asks.
-  </dynamic_skill_shell>
-</agent_skills>`,
-		};
 	});
 
 	pi.on("tool_call", async (event, ctx) => {

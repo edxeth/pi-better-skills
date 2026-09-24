@@ -1,5 +1,8 @@
 import { describe, it, expect } from "bun:test";
-import { stripPiDocsBlock } from "../src/pi-docs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { piDocsSkillFilePath, registerPiDocsRequestStrip, stripPiDocsBlock } from "../src/pi-docs";
 
 /** Mirrors pi core's built-in block (dist/core/system-prompt.js) — independent source of truth. */
 const REAL_BLOCK = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
@@ -11,6 +14,9 @@ const REAL_BLOCK = `Pi documentation (read only when the user asks about pi itse
 - When working on pi topics, read the docs and examples, and follow .md cross-references before implementing
 - Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
 
+/** A legitimately evolved block, as a pi update would produce; a second instance may capture it. */
+const EVOLVED_BLOCK = `${REAL_BLOCK.replace("- When working on pi topics", "- When building anything pi-related")}\n- Brand new bullet about docs/widgets.md`;
+
 function promptWithBlock(block: string): string {
 	return `You are an expert coding assistant operating inside pi.\n\nGuidelines:\n- Be concise in your responses\n\n${block}\n\nCurrent working directory: /tmp`;
 }
@@ -18,6 +24,11 @@ function promptWithBlock(block: string): string {
 /** pi >= 0.87 renders the prompt as <name>-tagged sections joined by blank lines (dist/core/system-prompt.js). */
 function promptWithDocsSection(block: string): string {
 	return `<rules>\n- Be concise in your responses\n</rules>\n\n<docs>\n${block}\n</docs>\n\n<project_context>\nUse tools per repo rules.\n</project_context>`;
+}
+
+function tempAgentDir(prefix: string): { agentDir: string; cleanup: () => void } {
+	const agentDir = mkdtempSync(join(tmpdir(), prefix));
+	return { agentDir, cleanup: () => rmSync(agentDir, { recursive: true, force: true }) };
 }
 
 describe("stripPiDocsBlock", () => {
@@ -167,72 +178,6 @@ describe("pi >= 0.87 section-wrapped prompts", () => {
 		expect(result?.block).toBe(evolved);
 		expect(result?.prompt).not.toContain("<docs>");
 	});
-
-	it("registration and before_agent_start strip remove the section end-to-end", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-sec-e2e-"));
-		try {
-			const stock = promptWithDocsSection(REAL_BLOCK);
-			expect(piDocsSkillRegistration(stock, agentDir)).toBeDefined();
-			const loaded = [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }];
-			const stripped = applyPiDocsStrip(stock, { skills: loaded }, agentDir);
-			expect(stripped).toBeDefined();
-			expect(stripped!).not.toContain("<docs>");
-			expect(stripped!).not.toContain("Pi documentation (read only");
-			expect(stripped!).toContain("<project_context>");
-		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("extension wiring registers the skill and strips the section through both handlers", async () => {
-		const { default: registerExtension } = await import("../src/index");
-		const { piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const handlers = new Map<string, (...args: unknown[]) => unknown>();
-		const extension = {
-			on(event: string, handler: (...args: unknown[]) => unknown) {
-				handlers.set(event, handler);
-			},
-			registerMessageRenderer() {},
-		};
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-wiring-sec-agent-"));
-		const cwd = mkdtempSync(join(tmpdir(), "pi-docs-wiring-sec-cwd-"));
-		const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
-		const stock = promptWithDocsSection(REAL_BLOCK);
-		try {
-			process.env.PI_CODING_AGENT_DIR = agentDir;
-			registerExtension(extension as never);
-			const context = {
-				cwd,
-				isProjectTrusted: () => false,
-				getSystemPrompt: () => stock,
-			};
-			const registration = await handlers.get("resources_discover")?.({}, context);
-			expect(registration).toEqual({ skillPaths: [join(agentDir, "cache", "pi-better-skills", "pi-docs")] });
-			const result = await handlers.get("before_agent_start")?.(
-				{
-					systemPrompt: stock,
-					systemPromptOptions: { skills: [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }] },
-				},
-				context,
-			);
-			const strippedPrompt = (result as { systemPrompt: string }).systemPrompt;
-			expect(strippedPrompt).not.toContain("<docs>");
-			expect(strippedPrompt).not.toContain("Pi documentation (read only");
-			expect(strippedPrompt).toContain("<agent_skills>");
-		} finally {
-			if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-			else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
-			rmSync(agentDir, { recursive: true, force: true });
-			rmSync(cwd, { recursive: true, force: true });
-		}
-	});
 });
 
 describe("piDocsSkillFilePath", () => {
@@ -258,39 +203,77 @@ describe("piDocsFeatureEnabled", () => {
 	});
 });
 
-describe("piDocsSkillRegistration", () => {
+// ---------------------------------------------------------------------------
+// Registration seam: one registerPiDocsRequestStrip call per extension instance
+// returns the discover callback the extension's resources_discover handler uses.
+// ---------------------------------------------------------------------------
+
+type FakeCommand = { name: string; source: string; sourceInfo?: { path: string } };
+
+/**
+ * One extension instance's wiring, at the same seam the extension factory uses:
+ * registerPiDocsRequestStrip(pi, agentDir) -> discover callback + request handler.
+ */
+function registeredStripFixture(agentDir: string) {
+	const contextHandlers: Array<(...args: unknown[]) => unknown> = [];
+	let loaded: FakeCommand[] = [];
+	const discover = registerPiDocsRequestStrip(
+		{
+			on(event: string, handler: (...args: unknown[]) => unknown) {
+				if (event === "context_with_system") contextHandlers.push(handler);
+				return () => {};
+			},
+			getCommands: () => loaded,
+		} as never,
+		agentDir,
+	);
+	return {
+		discover,
+		/** Fire the context_with_system handler the registration installed. */
+		strippedRequest: async (messages: unknown) =>
+			(await contextHandlers[0]?.({ type: "context_with_system", messages }, {})) as
+				| { messages: unknown[] }
+				| undefined,
+		load: () => {
+			loaded = [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: piDocsSkillFilePath(agentDir) } }];
+		},
+		setLoaded: (commands: FakeCommand[]) => {
+			loaded = commands;
+		},
+	};
+}
+
+describe("registerPiDocsRequestStrip discover callback", () => {
 	it("registers and syncs only when the feature is on and the block is present", async () => {
-		const { piDocsSkillRegistration } = await import("../src/pi-docs");
-		const { mkdtempSync, existsSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-reg-"));
+		const { piDocsSkillDirPath } = await import("../src/pi-docs");
+		const { existsSync } = await import("node:fs");
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-discover-");
 		try {
-			const withBlock = piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir);
-			expect(withBlock?.skillPaths).toEqual([join(agentDir, "cache", "pi-better-skills", "pi-docs")]);
+			const fixture = registeredStripFixture(agentDir);
+			const withBlock = fixture.discover(promptWithBlock(REAL_BLOCK));
+			expect(withBlock?.skillPaths).toEqual([piDocsSkillDirPath(agentDir)]);
 			expect(existsSync(join(withBlock!.skillPaths[0], "SKILL.md"))).toBe(true);
 
-			expect(piDocsSkillRegistration("no block here", agentDir)).toBeUndefined();
+			// No block: no registration, and the strip is disarmed for this instance.
+			expect(fixture.discover("no block here")).toBeUndefined();
 
 			const savedOptOut = process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
 			process.env.PI_BETTER_SKILLS_NO_PI_DOCS = "1";
 			try {
-				expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir)).toBeUndefined();
+				expect(fixture.discover(promptWithBlock(REAL_BLOCK))).toBeUndefined();
 			} finally {
 				if (savedOptOut === undefined) delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
 				else process.env.PI_BETTER_SKILLS_NO_PI_DOCS = savedOptOut;
 			}
 		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
+			cleanup();
 		}
 	});
 
 	it("emits precise debug diagnostics for success, sync failure, and anchor rejection", async () => {
-		const { piDocsSkillRegistration, piDocsSkillDirPath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-reg-debug-"));
+		const { piDocsSkillDirPath } = await import("../src/pi-docs");
+		const { writeFileSync } = await import("node:fs");
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-reg-debug-");
 		const occupied = join(agentDir, "occupied");
 		writeFileSync(occupied, "not a directory", "utf8");
 		const savedDebug = process.env.PI_BETTER_SKILLS_DEBUG;
@@ -300,25 +283,52 @@ describe("piDocsSkillRegistration", () => {
 			process.env.PI_BETTER_SKILLS_DEBUG = "1";
 			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
 
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir)).toBeDefined();
+			const fixture = registeredStripFixture(agentDir);
+			expect(fixture.discover(promptWithBlock(REAL_BLOCK))).toBeDefined();
 			expect(diagnostics).toEqual([
 				`[pi-better-skills:pi-docs] registered pi-docs skill {"path":"${piDocsSkillDirPath(agentDir)}"}`,
 			]);
 
 			diagnostics.length = 0;
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), occupied)).toBeUndefined();
+			// The occupied file IS the agentDir, so the skill sync's mkdir fails.
+			const blocked = registeredStripFixture(occupied);
+			expect(blocked.discover(promptWithBlock(REAL_BLOCK))).toBeUndefined();
 			expect(diagnostics).toEqual([
 				`[pi-better-skills:pi-docs] skill sync failed, staying stock {"agentDir":"${occupied}"}`,
 			]);
 
 			diagnostics.length = 0;
-			expect(piDocsSkillRegistration("no block here", agentDir)).toBeUndefined();
+			expect(fixture.discover("no block here")).toBeUndefined();
 			expect(diagnostics).toEqual([]);
 		} finally {
 			console.error = savedError;
 			if (savedDebug === undefined) delete process.env.PI_BETTER_SKILLS_DEBUG;
 			else process.env.PI_BETTER_SKILLS_DEBUG = savedDebug;
-			rmSync(agentDir, { recursive: true, force: true });
+			cleanup();
+		}
+	});
+
+	it("fails open on unwritable agentDir", async () => {
+		const { chmodSync } = await import("node:fs");
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-ro-");
+		try {
+			chmodSync(agentDir, 0o500);
+			expect(registeredStripFixture(agentDir).discover(promptWithBlock(REAL_BLOCK))).toBeUndefined();
+		} finally {
+			chmodSync(agentDir, 0o700);
+			cleanup();
+		}
+	});
+
+	it("honors --no-skills from the passed argv", async () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-ns-");
+		try {
+			const fixture = registeredStripFixture(agentDir);
+			expect(fixture.discover(promptWithBlock(REAL_BLOCK), ["pi", "--no-skills", "-p", "hi"])).toBeUndefined();
+			expect(fixture.discover(promptWithBlock(REAL_BLOCK), ["pi", "-ns"])).toBeUndefined();
+			expect(fixture.discover(promptWithBlock(REAL_BLOCK), ["pi", "--", "--no-skills"])).toBeDefined();
+		} finally {
+			cleanup();
 		}
 	});
 });
@@ -337,264 +347,307 @@ describe("pi-docs gate integrity (review findings)", () => {
 		const { stripPiDocsBlock } = await import("../src/pi-docs");
 		expect(stripPiDocsBlock(`${REAL_BLOCK}\n\nNext section`)).toBeUndefined();
 	});
+});
 
-	it("registration fails open on unwritable agentDir", async () => {
-		const { piDocsSkillRegistration } = await import("../src/pi-docs");
-		const { mkdtempSync, chmodSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-ro-"));
-		try {
-			chmodSync(agentDir, 0o500);
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir)).toBeUndefined();
-		} finally {
-			chmodSync(agentDir, 0o700);
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
+describe("hasLoadedPiDocsCommand (authoritative getCommands projection)", () => {
+	it("accepts only our exact skill name, source kind, and SKILL.md path", async () => {
+		const { hasLoadedPiDocsCommand } = await import("../src/pi-docs");
+		const agentDir = "/tmp/pi-docs-cmd-agent";
+		const ourPath = piDocsSkillFilePath(agentDir);
+		const loadedAtOurPath = [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: ourPath } }];
+		expect(hasLoadedPiDocsCommand(loadedAtOurPath, agentDir)).toBe(true);
 
-	it("registration honors --no-skills", async () => {
-		const { piDocsSkillRegistration } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-ns-"));
-		try {
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir, ["pi", "--no-skills", "-p", "hi"])).toBeUndefined();
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir, ["pi", "-ns"])).toBeUndefined();
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir, ["pi", "--", "--no-skills"])).toBeDefined();
-		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
-		}
+		// Name-only or path-only matches are not enough; a user's own pi-docs
+		// winning the first-wins collision stands us down.
+		expect(hasLoadedPiDocsCommand([{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: "/home/x/.pi/agent/skills/pi-docs/SKILL.md" } }], agentDir)).toBe(false);
+		expect(hasLoadedPiDocsCommand([{ name: "skill:other", source: "skill", sourceInfo: { path: ourPath } }], agentDir)).toBe(false);
+		expect(hasLoadedPiDocsCommand([{ name: "skill:pi-docs", source: "extension", sourceInfo: { path: ourPath } }], agentDir)).toBe(false);
+		expect(hasLoadedPiDocsCommand([{ name: "skill:pi-docs", source: "skill" }], agentDir)).toBe(false);
+
+		// Equivalent paths resolve to the same SKILL.md (relative agentDir spellings).
+		expect(hasLoadedPiDocsCommand([{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: `${agentDir}/cache/../cache/pi-better-skills/pi-docs/SKILL.md` } }], agentDir)).toBe(true);
 	});
 });
 
-describe("applyPiDocsStrip (strip follows the authoritative loaded skill)", () => {
-	it("strips only when our skill is the loaded one at our path and read is active", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-strip-"));
+/** The toolsAdded payload only rides along; its shape is irrelevant to the strip. */
+function toolDeclaration(): Record<string, unknown> {
+	return { name: "read", description: "Read file contents", parameters: { type: "object" } };
+}
+
+function sectionedDocsMessage(block: string): Record<string, unknown> {
+	return {
+		role: "system",
+		content: "",
+		sections: { preamble: "You are pi.", docs: `<docs>\n${block}\n</docs>`, cwd: "/tmp" },
+		toolsAdded: [toolDeclaration()],
+		toolsRemoved: [{ name: "grep", description: "old", parameters: {} }],
+		timestamp: 1,
+	};
+}
+
+describe("stripPiDocsFromRequestMessages", () => {
+	it("drops only the docs section and preserves every other system-message field", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const request = [
+			sectionedDocsMessage(REAL_BLOCK),
+			{ role: "user", content: "hello", timestamp: 2 },
+		];
+		const stripped = stripPiDocsFromRequestMessages(request as never, REAL_BLOCK);
+		expect(stripped).toBeDefined();
+		expect(stripped).toHaveLength(2);
+		// Non-system messages pass through unchanged.
+		expect(stripped![1]).toEqual(request[1]);
+		const head = stripped![0] as { sections: Record<string, string>; toolsAdded: unknown[]; toolsRemoved: unknown[]; timestamp: number };
+		expect(head.sections).toEqual({ preamble: "You are pi.", cwd: "/tmp" });
+		expect(head.toolsAdded).toEqual([toolDeclaration()]);
+		expect(head.toolsRemoved).toEqual([{ name: "grep", description: "old", parameters: {} }]);
+		expect(head.timestamp).toBe(1);
+	});
+
+	it("excises the captured block from flat system content without touching neighbors", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const head = {
+			role: "system",
+			content: `Guidelines:\n- Be concise\n\n${REAL_BLOCK}\nCurrent working directory: /tmp`,
+			timestamp: 1,
+		};
+		const stripped = stripPiDocsFromRequestMessages([head, { role: "assistant", content: "ok" }] as never, REAL_BLOCK);
+		expect((stripped![0] as { content: string }).content).toBe("Guidelines:\n- Be concise\n\nCurrent working directory: /tmp");
+	});
+
+	it("preserves neighbors at every flat position (start, middle, end)", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const strip = (content: string) =>
+			(stripPiDocsFromRequestMessages([{ role: "system", content, timestamp: 1 }] as never, REAL_BLOCK)! [0] as { content: string }).content;
+		// Block at the very end: no trailing separator left behind.
+		expect(strip(`Guidelines: active\n\n${REAL_BLOCK}`)).toBe("Guidelines: active");
+		// Block at the start: the join to the next section survives.
+		expect(strip(`\n\n${REAL_BLOCK}\nTail`)).toBe("\n\nTail");
+		// Block glued to following text: the text survives intact.
+		expect(strip(`prefix\n\n${REAL_BLOCK}Tail\nMore`)).toBe("prefix\n\nTail\nMore");
+		// Redundant blank lines after the block collapse to one join.
+		expect(strip(`prefix\n\n${REAL_BLOCK}\n\n\nTail`)).toBe("prefix\n\nTail");
+	});
+
+	it("cleans a mid-conversation docs patch while other section updates survive", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const patch = {
+			role: "system",
+			content: "",
+			sections: { docs: `<docs>\n${REAL_BLOCK}\n</docs>`, rules: "- New rule" },
+			timestamp: 2,
+		};
+		const stripped = stripPiDocsFromRequestMessages([{ role: "user", content: "hi", timestamp: 1 }, patch] as never, REAL_BLOCK);
+		expect(stripped).toBeDefined();
+		expect((stripped![1] as { sections: Record<string, string | null> }).sections).toEqual({ rules: "- New rule", docs: null });
+		// A removal marker (null) is not ours to touch.
+		const removal = { role: "system", content: "", sections: { docs: null }, timestamp: 3 };
+		expect(stripPiDocsFromRequestMessages([removal] as never, REAL_BLOCK)).toBeUndefined();
+	});
+
+	it("returns undefined when no system message carries the exact captured block", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const drifted = sectionedDocsMessage(REAL_BLOCK) as { sections: Record<string, string> };
+		drifted.sections.docs = "<docs>\nSome other extension's docs\n</docs>";
+		const request = [drifted, { role: "user", content: "hello", timestamp: 2 }];
+		expect(stripPiDocsFromRequestMessages(request as never, REAL_BLOCK)).toBeUndefined();
+
+		// A docs section that merely CONTAINS the block plus extra text is not ours to remove.
+		const superset = sectionedDocsMessage(REAL_BLOCK) as { sections: Record<string, string> };
+		superset.sections.docs = `<docs>\n${REAL_BLOCK}\n- extra\n</docs>`;
+		expect(stripPiDocsFromRequestMessages([superset] as never, REAL_BLOCK)).toBeUndefined();
+	});
+});
+
+describe("applyPiDocsRequestStrip (per-request gate)", () => {
+	it("strips only when the feature is on, the block is captured, and our skill is loaded", async () => {
+		const { applyPiDocsRequestStrip } = await import("../src/pi-docs");
+		const request = [sectionedDocsMessage(REAL_BLOCK), { role: "user", content: "hi", timestamp: 2 }];
+		const agentDir = "/tmp/pi-docs-req-strip-agent";
+		const loadedAtOurPath = [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: piDocsSkillFilePath(agentDir) } }];
+		const savedOptOut = process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
 		try {
-			const stock = promptWithBlock(REAL_BLOCK);
-			expect(piDocsSkillRegistration(stock, agentDir)).toBeDefined();
+			// No captured block: stand down even with the skill "loaded".
+			expect(applyPiDocsRequestStrip(request as never, undefined, loadedAtOurPath, agentDir)).toBeUndefined();
 
-			const ourPath = piDocsSkillFilePath(agentDir);
-			const loaded = [
-				{ name: "other", filePath: "/home/x/.pi/agent/skills/other/SKILL.md" },
-				{ name: "pi-docs", filePath: ourPath },
-			];
-			const stripped = applyPiDocsStrip(stock, { skills: loaded, selectedTools: ["read", "bash"] }, agentDir);
-			expect(stripped).toBeDefined();
-			expect(stripped!).not.toContain("Pi documentation (read only");
+			const stripped = applyPiDocsRequestStrip(request as never, REAL_BLOCK, loadedAtOurPath, agentDir);
+			expect((stripped![0] as { sections: Record<string, string> }).sections).toEqual({ preamble: "You are pi.", cwd: "/tmp" });
 
-			// not loaded at our path (user's own pi-docs won the first-wins collision): stock stays
-			const colliding = [{ name: "pi-docs", filePath: "/home/x/.pi/agent/skills/pi-docs/SKILL.md" }];
-			expect(applyPiDocsStrip(stock, { skills: colliding }, agentDir)).toBeUndefined();
+			// Loaded-set missing or collided: stand down.
+			expect(applyPiDocsRequestStrip(request as never, REAL_BLOCK, [], agentDir)).toBeUndefined();
+			expect(
+				applyPiDocsRequestStrip(request as never, REAL_BLOCK, [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: "/home/x/.pi/agent/skills/pi-docs/SKILL.md" } }], agentDir),
+			).toBeUndefined();
 
-			// selectedTools without "read" still strips: verified live that the event's
-			// selectedTools does not reflect the prompt-build toolset (exec_command reads)
-			const noReadListed = applyPiDocsStrip(stock, { skills: loaded, selectedTools: ["exec_command"] }, agentDir);
-			expect(noReadListed).toBeDefined();
-
-			// no authoritative skill set at all: stock stays
-			expect(applyPiDocsStrip(stock, {}, agentDir)).toBeUndefined();
-
-			// Removing a block at the end does not leave a trailing separator.
-			const prefix = "Guidelines: active";
-			expect(applyPiDocsStrip(`${prefix}\n\n${REAL_BLOCK}`, { skills: loaded }, agentDir)).toBe(prefix);
-
-			// A changed captured block is not stripped: fail open rather than guessing.
-			const driftedPrompt = stock.replace("- Examples: ", "- Sample files: ");
-			expect(applyPiDocsStrip(driftedPrompt, { skills: loaded }, agentDir)).toBeUndefined();
-
-			// The exact captured block at the start of a prompt has no required anchor.
-			expect(applyPiDocsStrip(`${REAL_BLOCK}\n\nNext section`, { skills: loaded }, agentDir)).toBeUndefined();
-
-			const savedOptOut = process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
+			// Env opt-out beats everything.
 			process.env.PI_BETTER_SKILLS_NO_PI_DOCS = "1";
-			try {
-				expect(applyPiDocsStrip(stock, { skills: loaded }, agentDir)).toBeUndefined();
-			} finally {
-				if (savedOptOut === undefined) delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
-				else process.env.PI_BETTER_SKILLS_NO_PI_DOCS = savedOptOut;
-			}
+			expect(applyPiDocsRequestStrip(request as never, REAL_BLOCK, loadedAtOurPath, agentDir)).toBeUndefined();
 		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
+			if (savedOptOut === undefined) delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
+			else process.env.PI_BETTER_SKILLS_NO_PI_DOCS = savedOptOut;
 		}
-	});
-
-	it("writes the strip-time prompt diagnostic only in debug mode", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, existsSync, readFileSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-debug-"));
-		const promptDump = `/tmp/pi-better-skills-pidocs-prompt-${process.pid}.txt`;
-		const stock = promptWithBlock(REAL_BLOCK);
-		const savedDebug = process.env.PI_BETTER_SKILLS_DEBUG;
-		const savedError = console.error;
-		const diagnostics: string[] = [];
-		try {
-			rmSync(promptDump, { force: true });
-			delete process.env.PI_BETTER_SKILLS_DEBUG;
-			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
-			expect(piDocsSkillRegistration(stock, agentDir)).toBeDefined();
-			const loaded = { name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) };
-			expect(applyPiDocsStrip(stock, { skills: [loaded] }, agentDir)).toBeDefined();
-			expect(existsSync(promptDump)).toBe(false);
-			expect(diagnostics).toEqual([]);
-
-			process.env.PI_BETTER_SKILLS_DEBUG = "1";
-			const stripped = applyPiDocsStrip(
-				stock,
-				{ skills: [loaded] },
-				agentDir,
-			);
-			expect(stripped).toBeDefined();
-			expect(readFileSync(promptDump, "utf8")).toBe(stock);
-			expect(diagnostics).toEqual(["[pi-better-skills:pi-docs] dumped strip-time prompt {\"skills\":1}"]);
-		} finally {
-			console.error = savedError;
-			if (savedDebug === undefined) delete process.env.PI_BETTER_SKILLS_DEBUG;
-			else process.env.PI_BETTER_SKILLS_DEBUG = savedDebug;
-			rmSync(promptDump, { force: true });
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("stays stock when the generated skill is not loaded, including in debug mode", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-debug-gate-"));
-		const savedDebug = process.env.PI_BETTER_SKILLS_DEBUG;
-		const savedError = console.error;
-		const diagnostics: string[] = [];
-		const stock = promptWithBlock(REAL_BLOCK);
-		try {
-			expect(piDocsSkillRegistration(stock, agentDir)).toBeDefined();
-			process.env.PI_BETTER_SKILLS_DEBUG = "1";
-			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
-			expect(applyPiDocsStrip(stock, {}, agentDir)).toBeUndefined();
-			expect(diagnostics).toEqual([
-				"[pi-better-skills:pi-docs] dumped strip-time prompt {}",
-				"[pi-better-skills:pi-docs] skill not loaded at our path, staying stock",
-			]);
-		} finally {
-			console.error = savedError;
-			if (savedDebug === undefined) delete process.env.PI_BETTER_SKILLS_DEBUG;
-			else process.env.PI_BETTER_SKILLS_DEBUG = savedDebug;
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("requires a current capture and preserves meaningful content around it", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-exact-strip-"));
-		const loaded = { name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) };
-		try {
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir)).toBeDefined();
-
-			expect(applyPiDocsStrip(`\n\n${REAL_BLOCK}\nTail`, { skills: [loaded] }, agentDir)).toBe("\n\nTail");
-			expect(applyPiDocsStrip(`prefix\n\n${REAL_BLOCK}\n\n\nTail`, { skills: [loaded] }, agentDir)).toBe("prefix\n\nTail");
-			expect(applyPiDocsStrip(`prefix\n\n${REAL_BLOCK}Tail\nMore`, { skills: [loaded] }, agentDir)).toBe("prefix\n\nTail\nMore");
-		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("does not strip a prompt when discovery captured nothing", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const agentDir = "/tmp/pi-docs-no-capture-agent";
-		expect(piDocsSkillRegistration("no block here", agentDir)).toBeUndefined();
-		expect(
-			applyPiDocsStrip("prefix\n\nundefined\nsuffix", {
-				skills: [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }],
-			}, agentDir),
-		).toBeUndefined();
 	});
 });
 
-describe("pi-docs extension wiring", () => {
-	it("registers the generated skill and strips through pi's two event handlers", async () => {
+describe("registerPiDocsRequestStrip", () => {
+	it("consults the live command projection on every request, so a later collision stands down", async () => {
+		const { stripPiDocsFromRequestMessages } = await import("../src/pi-docs");
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-reg-strip-");
+		try {
+			const fixture = registeredStripFixture(agentDir);
+			const request = [sectionedDocsMessage(REAL_BLOCK), { role: "user", content: "hi", timestamp: 2 }];
+
+			// Not loaded: handler keeps the messages untouched.
+			fixture.discover(promptWithBlock(REAL_BLOCK));
+			expect(await fixture.strippedRequest(request)).toBeUndefined();
+
+			// Loaded at our path: handler returns the stripped messages.
+			fixture.load();
+			const result = await fixture.strippedRequest(request);
+			expect(result?.messages).toEqual(stripPiDocsFromRequestMessages(request as never, REAL_BLOCK));
+			expect((result!.messages[0] as { sections: Record<string, string> }).sections).not.toHaveProperty("docs");
+
+			// The projection is consulted per request, so a mid-session collision
+			// (user's pi-docs wins) flips the handler back to stock without re-registration.
+			fixture.setLoaded([{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: "/home/x/.pi/agent/skills/pi-docs/SKILL.md" } }]);
+			expect(await fixture.strippedRequest(request)).toBeUndefined();
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("a drifted re-discovery disarms this instance even while the skill stays loaded", async () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-stale-");
+		try {
+			const fixture = registeredStripFixture(agentDir);
+			const request = [sectionedDocsMessage(REAL_BLOCK)];
+			fixture.discover(promptWithBlock(REAL_BLOCK));
+			fixture.load();
+			expect((await fixture.strippedRequest(request))?.messages).toBeDefined();
+
+			// Next discovery pass drifts: this instance's capture clears, the strip
+			// stands down even though the registered skill is still in the loaded set.
+			expect(fixture.discover("Guidelines only, no block")).toBeUndefined();
+			expect(await fixture.strippedRequest(request)).toBeUndefined();
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("registerPiDocsRequestStrip capture isolation (per extension instance)", () => {
+	it("one instance's drifted discovery cannot disarm another instance's capture", async () => {
+		const first = tempAgentDir("pi-docs-iso-a-");
+		const second = tempAgentDir("pi-docs-iso-b-");
+		try {
+			const instanceA = registeredStripFixture(first.agentDir);
+			const instanceB = registeredStripFixture(second.agentDir);
+			const request = [sectionedDocsMessage(REAL_BLOCK)];
+
+			instanceA.discover(promptWithBlock(REAL_BLOCK));
+			instanceA.load();
+			// Sibling instance discovers a drifted prompt (or opts out, or fails its
+			// sync): only ITS OWN capture state may change.
+			expect(instanceB.discover("Guidelines only, no block")).toBeUndefined();
+
+			expect((await instanceA.strippedRequest(request))?.messages).toBeDefined();
+		} finally {
+			first.cleanup();
+			second.cleanup();
+		}
+	});
+
+	it("simultaneous instances strip with their own captured blocks and agent dirs", async () => {
+		const first = tempAgentDir("pi-docs-iso-c-");
+		const second = tempAgentDir("pi-docs-iso-d-");
+		try {
+			const instanceA = registeredStripFixture(first.agentDir);
+			const instanceB = registeredStripFixture(second.agentDir);
+			instanceA.discover(promptWithBlock(REAL_BLOCK));
+			instanceB.discover(promptWithBlock(EVOLVED_BLOCK));
+			instanceA.load();
+			instanceB.load();
+
+			const withRealBlock = [sectionedDocsMessage(REAL_BLOCK)];
+			const withEvolvedBlock = [sectionedDocsMessage(EVOLVED_BLOCK)];
+
+			// Each instance removes exactly its own captured block.
+			expect(
+				((await instanceA.strippedRequest(withRealBlock))!.messages[0] as { sections: Record<string, string> }).sections,
+			).toEqual({ preamble: "You are pi.", cwd: "/tmp" });
+			expect(
+				((await instanceB.strippedRequest(withEvolvedBlock))!.messages[0] as { sections: Record<string, string> }).sections,
+			).toEqual({ preamble: "You are pi.", cwd: "/tmp" });
+
+			// A's strip does not fire on a request carrying B's block (exact match only).
+			expect(await instanceA.strippedRequest(withEvolvedBlock)).toBeUndefined();
+			expect(await instanceB.strippedRequest(withRealBlock)).toBeUndefined();
+		} finally {
+			first.cleanup();
+			second.cleanup();
+		}
+	});
+});
+
+describe("pi-docs extension wiring (src/index.ts)", () => {
+	it("factory wires discovery through the returned callback; the per-request strip owns docs removal", async () => {
 		const { default: registerExtension } = await import("../src/index");
-		const { piDocsSkillFilePath } = await import("../src/pi-docs");
+		const { piDocsSkillDirPath } = await import("../src/pi-docs");
 		const { mkdtempSync, rmSync } = await import("node:fs");
 		const { tmpdir } = await import("node:os");
 		const { join } = await import("node:path");
-		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+		let loaded: Array<{ name: string; source: string; sourceInfo: { path: string } }> = [];
 		const extension = {
 			on(event: string, handler: (...args: unknown[]) => unknown) {
-				handlers.set(event, handler);
+				const list = handlers.get(event) ?? [];
+				list.push(handler);
+				handlers.set(event, list);
+				return () => {};
 			},
 			registerMessageRenderer() {},
+			getCommands: () => loaded,
 		};
 		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-wiring-agent-"));
 		const cwd = mkdtempSync(join(tmpdir(), "pi-docs-wiring-cwd-"));
 		const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
-		const stock = promptWithBlock(REAL_BLOCK);
+		const context = {
+			cwd,
+			isProjectTrusted: () => false,
+			getSystemPrompt: () => promptWithDocsSection(REAL_BLOCK),
+		};
 		try {
 			process.env.PI_CODING_AGENT_DIR = agentDir;
 			registerExtension(extension as never);
-			const context = {
-				cwd,
-				isProjectTrusted: () => false,
-				getSystemPrompt: () => stock,
-			};
-			const registrationHandler = handlers.get("resources_discover");
-			expect(registrationHandler).toBeDefined();
-			const registration = await registrationHandler?.({}, context);
-			expect(registration).toEqual({ skillPaths: [join(agentDir, "cache", "pi-better-skills", "pi-docs")] });
 
-			const stripHandler = handlers.get("before_agent_start");
-			expect(stripHandler).toBeDefined();
-			const result = await stripHandler?.(
-				{
-					systemPrompt: stock,
-					systemPromptOptions: { skills: [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }] },
-				},
-					context,
-				);
-				const strippedPrompt = (result as { systemPrompt: string }).systemPrompt;
-				expect(strippedPrompt).not.toContain("Pi documentation (read only");
-				expect(strippedPrompt).toContain("<agent_skills>");
+			// The factory registered the per-request strip at construction time and
+			// routes resources_discover through its returned discover callback.
+			const discoverHandler = handlers.get("resources_discover")?.[0];
+			expect(discoverHandler).toBeDefined();
+			expect(handlers.get("context_with_system")?.[0]).toBeDefined();
 
-				const noOptionsResult = await stripHandler?.({ systemPrompt: stock }, context);
-				const stockPrompt = (noOptionsResult as { systemPrompt: string }).systemPrompt;
-				expect(stockPrompt).toContain("Pi documentation (read only");
-				expect(stockPrompt).toContain("<agent_skills>");
-			} finally {
+			const registration = await discoverHandler?.({}, context);
+			expect(registration).toEqual({ skillPaths: [piDocsSkillDirPath(agentDir)] });
+
+			loaded = [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: piDocsSkillFilePath(agentDir) } }];
+			const stripHandler = handlers.get("context_with_system")![0];
+			const request = [
+				{ role: "system", content: "", sections: { docs: `<docs>\n${REAL_BLOCK}\n</docs>`, cwd: "/tmp" }, timestamp: 1 },
+				{ role: "user", content: "hi", timestamp: 2 },
+			];
+			const result = (await stripHandler({ type: "context_with_system", messages: request }, context)) as
+				| { messages: Array<Record<string, unknown>> }
+				| undefined;
+			expect(result?.messages?.[0]?.sections).toEqual({ cwd: "/tmp" });
+
+			// A drifted re-discovery through the same handler disarms the strip.
+			await discoverHandler?.({}, { ...context, getSystemPrompt: () => "Guidelines only, no block" });
+			expect(await stripHandler({ type: "context_with_system", messages: request }, context)).toBeUndefined();
+		} finally {
 			if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 			rmSync(agentDir, { recursive: true, force: true });
 			rmSync(cwd, { recursive: true, force: true });
-		}
-	});
-});
-
-describe("stale capture cannot outlive a failed discovery pass", () => {
-	it("a drifted discovery clears capture so the strip stands down even if the skill stays loaded", async () => {
-		const { piDocsSkillRegistration, applyPiDocsStrip, piDocsSkillFilePath } = await import("../src/pi-docs");
-		const { mkdtempSync, rmSync } = await import("node:fs");
-		const { tmpdir } = await import("node:os");
-		const { join } = await import("node:path");
-		const agentDir = mkdtempSync(join(tmpdir(), "pi-docs-stale-"));
-		try {
-			expect(piDocsSkillRegistration(promptWithBlock(REAL_BLOCK), agentDir)).toBeDefined();
-			// next discovery: pi's prompt drifted, no block found
-			expect(piDocsSkillRegistration("Guidelines only, no block", agentDir)).toBeUndefined();
-			// skill still in the authoritative loaded set, block text still in the prompt:
-			// the strip must still stand down — capture is gone
-			const stillLoaded = [{ name: "pi-docs", filePath: piDocsSkillFilePath(agentDir) }];
-			expect(applyPiDocsStrip(promptWithBlock(REAL_BLOCK), { skills: stillLoaded }, agentDir)).toBeUndefined();
-		} finally {
-			rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 });

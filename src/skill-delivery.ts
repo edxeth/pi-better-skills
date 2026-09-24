@@ -34,25 +34,25 @@ import { extractPathCandidates } from "./tool-paths";
 const execAsync = promisify(exec);
 const MAX_DYNAMIC_OUTPUT_CHARS = 50_000;
 
+/**
+ * The per-skill block carries only the skill-specific directories. The
+ * general path_policy/dynamic_skill_shell guidance lives once in the
+ * system-level <agent_skills> section injected on every request
+ * (agent-skills-prompt.ts), not once per delivered body.
+ */
 export function skillContextBlock(skill: { baseDir: string }, workspace: string): string {
 	return [
 		"<skill_context>",
 		"  <skill_dir>" + skill.baseDir + "</skill_dir>",
 		"  <workspace_dir>" + workspace + "</workspace_dir>",
-		"",
-		"  <path_policy>",
-		"    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.",
-		"    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.",
-		"    Use $PI_SKILL_DIR/path for explicit bundled skill files.",
-		"    Use $PI_WORKSPACE/path for explicit workspace/project files.",
-		"  </path_policy>",
 		"</skill_context>",
 	].join("\n");
 }
 
 export function insertSkillContext(text: string, skill: { baseDir: string }, workspace: string, body?: string): string {
-	if (text.includes("<skill_context>")) return text;
 	const context = skillContextBlock(skill, workspace);
+	// An author's example or older context block is not our complete guidance.
+	if (text.includes(context)) return text;
 	const frontmatter = text.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
 	if (!frontmatter) {
 		// A wrapped tool can prefix status text before the body; place the

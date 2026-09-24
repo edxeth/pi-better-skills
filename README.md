@@ -64,7 +64,14 @@ Without this extension, users and skill authors have to over-explain paths:
 - “Do not run this from the project root.”
 - “If it fails, retry with `/home/.../skills/...`.”
 
-`pi-better-skills` injects skill-local context when a `SKILL.md` is loaded, so the model sees where the skill lives and which paths belong to the skill versus the workspace.
+`pi-better-skills` injects a small `<skill_context>` block when a `SKILL.md` is loaded, so the model sees where the skill lives and which paths belong to the skill versus the workspace.
+
+The path and command guidance travels in two places:
+
+- **System prompt.** A short `<agent_skills>` section sits in the system prompt of every request. It stays exactly the same for the whole conversation, so nothing appears and disappears between replies. It is added as each request is sent and never written into your session files.
+- **Skill bodies.** Each delivered skill body carries a small `<skill_context>` block naming the skill's folder and your project folder, so the rules point at the right places.
+
+The extension does not modify the original `SKILL.md` file. If compaction removes the skill text, loading it again restores the directory context too.
 
 ### Better compatibility with Agent Skills
 
@@ -81,7 +88,7 @@ Pi core keeps skills simple and asks the model to resolve relative paths itself.
 
 Pi core injects a "Pi documentation" block (~280 tokens) into every system prompt, pointing the model at the installed package's README, `docs/`, and `examples/`. `pi-better-skills` can convert that block into a generated skill so its content loads on demand instead:
 
-- The block is stripped from the system prompt, and a `pi-docs` skill is registered whose body is inherited verbatim from the live block — it always matches the installed pi's wording and paths, on every OS and install location.
+- The block is removed from every request sent to the model, including replies started by background helpers or by tool results. A `pi-docs` skill is registered whose body is inherited verbatim from the live block, matching the installed Pi's wording and paths.
 - The skill file lives at `<agent-dir>/cache/pi-better-skills/pi-docs/SKILL.md`, outside pi's native skill roots, and is rewritten only when pi's block changes.
 - One gate: the strip happens only when the skill actually loaded at that path. If pi's prompt drifts past the structural anchors (header line and first bullet), the session falls back to completely stock behavior — no strip, no skill, nothing broken. Uninstalling the extension removes the feature and the file together.
 - A user's own `pi-docs` skill wins name collisions; the extension stands down.
@@ -93,6 +100,8 @@ PI_BETTER_SKILLS_NO_PI_DOCS=1 pi   # or export it, or write it inline per comman
 ```
 
 `PI_BETTER_SKILLS_NO_PI_DOCS=1 pi ...` also works for one-off runs. Set `PI_BETTER_SKILLS_DEBUG=1` for maintainer diagnostics on stderr.
+
+Pi's saved session files keep the original block; only what gets sent to the model is trimmed. Everything else in the prompt is left untouched.
 
 ## When to use it
 
@@ -131,7 +140,7 @@ You can mention multiple skills in one message:
 /skill:visual-explainer What's docs.lakebed.dev about? /skill:firecrawl
 ```
 
-For multi-skill messages, `pi-better-skills` handles the skill expansion itself: each resolvable skill appears as its own `[skill] <name>` conversation row before the cleaned user prompt, and the model receives the skill content before the question. A leading `/skill:name` declaration is stripped from the sent prompt (like vanilla pi); skills mentioned later keep their bare name in the sentence. Ordinary single leading `/skill:name` commands still fall through to Pi core.
+For multi-skill messages, `pi-better-skills` handles the skill expansion itself: each resolvable skill appears as its own `[skill] <name>` conversation row before the cleaned user prompt, and the model receives the skill content before the question. A leading `/skill:name` declaration is stripped from the sent prompt (like vanilla pi); skills mentioned later keep their bare name in the sentence. Ordinary single leading `/skill:name` commands retain Pi's single-skill message layout and receive the same saved guidance as file reads.
 
 After installing or editing the extension in an existing pi session, reload pi:
 
@@ -197,6 +206,8 @@ Dynamic commands run from the current workspace and receive:
 
 - `PI_SKILL_DIR` — the active skill directory
 - `PI_WORKSPACE` — the current pi workspace
+
+Skill commands such as `/skill:name`, automatic loading, and referenced skills do not execute these placeholders. They show a skipped notice instead. The system-level guidance tells the model not to run the placeholders or repeat their commands unless you ask.
 
 Use this for lightweight context that genuinely helps the workflow. Do not use it for slow setup, long-running processes, or surprising side effects.
 
@@ -302,7 +313,7 @@ Dot files are matched. Bare patterns without a `/` match against the filename, s
 
 ### What gets injected
 
-The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block with path resolution hints, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills — they are neutralized with a visible note. They only run when you read the skill directly.
+The extension reads the skill's `SKILL.md`, adds a `<skill_context>` block naming the skill's directory and the workspace, and prepends the result. Dynamic shell placeholders (`!`backtick) are **not** executed for auto-injected skills — they are neutralized with a visible note. They only run when you read the skill directly.
 
 Skills with `disable-model-invocation: true` are not auto-injected by `globs`. They remain available through explicit `/skill:name` commands, matching Pi's opt-out semantics for model-driven invocation.
 
@@ -331,7 +342,7 @@ References expand wherever a skill body enters context:
 
 | Load path | Behavior |
 |----------|----------|
-| `/skill:name` command | The extension expands the command itself when the skill has resolvable references (extra `[skill]` rows appear before your prompt). Skills without references still use pi core's ordinary expansion. |
+| `/skill:name` command | The extension attaches guidance to every resolvable skill. Skills with references get extra `[skill]` rows before your prompt; ordinary single-skill commands keep Pi's single-block layout. |
 | Model reads a `SKILL.md` | Referenced skill bodies are appended to the read result. |
 | `globs` auto-injection | Referenced skill bodies are appended to the injected block. |
 | Multi-skill input (`/skill:a ... /skill:b`) | Referenced skills arrive as their own `[skill]` rows. |
