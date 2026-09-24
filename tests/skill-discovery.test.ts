@@ -137,6 +137,20 @@ describe("bootstrap discovery via pi public APIs", () => {
 			project.cleanup();
 		}
 	});
+	it("leaves results alone when the producing tool claims explicit skill ownership", async () => {
+		const project = await setupProject({ ".pi/skills/probe/SKILL.md": SKILL("probe") });
+		try {
+			const skillPath = join(project.root, ".pi/skills/probe/SKILL.md");
+			const event = project.readEvent(skillPath, SKILL("probe"));
+			const owned = { ...event, details: { piBetterSkills: { version: 1, handling: "explicit" } } };
+			expect(await project.emit("tool_result", owned)).toBeUndefined();
+			const future = { ...event, details: { piBetterSkills: { version: 2, handling: "explicit" } } };
+			const blocks = ((await project.emit("tool_result", future)) as { content?: TextBlock[] } | undefined)?.content ?? [];
+			expect(blocks[0]?.text).toContain("<skill_context>");
+		} finally {
+			project.cleanup();
+		}
+	});
 
 	it("discovers a settings skills array entry from project settings", async () => {
 		const project = await setupProject({
