@@ -628,6 +628,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			residency.releaseToolCall(event.toolCallId);
 			return;
 		}
+		// v1 explicit ownership: the producing tool owns raw reads and skill loading (see README).
+		const owner = (event as { details?: { piBetterSkills?: { version?: unknown; handling?: unknown } } }).details?.piBetterSkills;
+		if (owner?.version === 1 && owner.handling === "explicit") return;
 		const toolEvent = event as unknown as DeliveryEvent;
 		const plan = delivery.buildDeliveryPlan(toolEvent, ctx);
 		if (!plan) return undefined;
