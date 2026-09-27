@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createEventBus, SessionManager } from "@earendil-works/pi-coding-agent";
 
 /**
  * Globs auto-injection through the registered tool_result handler. Structured
@@ -43,6 +43,7 @@ function makeFakePi(cwd: string) {
 		sessionManager,
 	};
 	const pi = {
+		events: createEventBus(),
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 		},

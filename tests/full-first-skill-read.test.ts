@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SessionManager, createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
+import { createEventBus, SessionManager, createBashTool, createReadTool } from "@earendil-works/pi-coding-agent";
 
 /**
  * First-load completeness: the first time a SKILL.md is loaded in a session
@@ -83,6 +83,7 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 	};
 	const thinkingCalls: string[] = [];
 	const pi = {
+		events: createEventBus(),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerMessageRenderer: () => {},
 		sendMessage: () => {},

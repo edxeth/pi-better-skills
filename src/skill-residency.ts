@@ -1,13 +1,15 @@
 import { buildSessionContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { contentText, normalizeSkillText, skillDocument, type SkillCatalog, type SkillRecord } from "./skill-catalog";
+import { contentText, normalizeSkillText, skillDocument, type SkillCatalog, type SkillDocument, type SkillRecord } from "./skill-catalog";
 
 /**
  * Residency: persisted evidence that a skill body is in the transcript, plus
  * the in-flight reservations that keep parallel deliveries from appending the
  * same body twice. Reconciliation is anchor-first: each anchor resolves to the
  * catalog records it can own, and only those records' cached bodies are
- * validated. Full-context reconstruction stays for session load, compaction,
- * tree navigation, and leaf changes.
+ * validated. Results this extension transformed at delivery carry exact
+ * recorded evidence instead (see recordDeliveredResult). Full-context
+ * reconstruction stays for session load, compaction, tree navigation, and leaf
+ * changes.
  */
 
 export type SkillResidency = ReturnType<typeof createSkillResidency>;
@@ -18,7 +20,7 @@ type ResidencyAnchor =
 	| { kind: "directory"; directory: string; start: number; end: number }
 	| { kind: "wrapper"; name: string; location: string; start: number; end: number };
 
-type ResidencyMessage = { text: string; anchors: ResidencyAnchor[] };
+type ResidencyMessage = { text: string; anchors: ResidencyAnchor[]; toolCallId?: string };
 
 function sessionMessageText(message: SessionContextMessage): string {
 	if (message.role === "toolResult" && message.isError) return "";
@@ -48,12 +50,20 @@ function residencyMessage(message: SessionContextMessage): ResidencyMessage | un
 			anchors.push({ kind: "wrapper", name, location, start, end });
 		}
 	}
-	return { text, anchors };
+	return { text, anchors, toolCallId: message.role === "toolResult" ? message.toolCallId : undefined };
 }
 
 export function createSkillResidency(catalog: SkillCatalog) {
 	let injectedSkillNames = new Set<string>();
 	let reservedSkillNames = new Set<string>();
+	let queuedSkillNames = new Set<string>();
+	// Exact evidence for results this extension transformed at delivery: the
+	// complete result text produced for a confirmed complete skill body, keyed
+	// by tool call. Credit still requires the persisted non-error result with
+	// that id to contain the recorded text and the source body to be unchanged,
+	// so replaced or removed results cannot keep a claim alive. Entries survive
+	// branch moves within the session and clear only with the session.
+	let deliveredResults = new Map<string, { name: string; filePath: string; bodySnapshot: string; text: string }>();
 	let reservationsByToolCall = new Map<string, Set<string>>();
 	let reconciledSessionId: string | undefined;
 	let reconciledLeafId: string | null | undefined;
@@ -70,14 +80,34 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		return true;
 	}
 
+	/**
+	 * An API delivery owns its reservation until its skill message persists or
+	 * the session is replaced. Turn, run, compaction, and tree resets keep it:
+	 * the message can still be waiting in Pi's pending queue at those points.
+	 */
+	function reserveQueued(name: string): boolean {
+		if (!reserve(name)) return false;
+		queuedSkillNames.add(name);
+		return true;
+	}
+
+	function isQueued(name: string): boolean {
+		return queuedSkillNames.has(name);
+	}
+
+	/** Record what delivery actually produced for one complete skill result. */
+	function recordDeliveredResult(toolCallId: string, name: string, doc: SkillDocument, text: string): void {
+		deliveredResults.set(toolCallId, { name, filePath: doc.filePath, bodySnapshot: doc.body, text });
+	}
+
 	function releaseSkills(names: Iterable<string>): void {
 		for (const name of names) reservedSkillNames.delete(name);
 	}
 
+	/** Release transient tool-result reservations; API deliveries keep theirs (see reserveQueued). */
 	function releaseAll(): void {
-		for (const names of reservationsByToolCall.values()) releaseSkills(names);
 		reservationsByToolCall = new Map();
-		reservedSkillNames = new Set();
+		reservedSkillNames = new Set(queuedSkillNames);
 	}
 
 	function releaseToolCall(toolCallId: string): void {
@@ -97,6 +127,8 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	}
 
 	function clear(): void {
+		queuedSkillNames = new Set();
+		deliveredResults = new Map();
 		releaseAll();
 		injectedSkillNames = new Set();
 		activeSkill = undefined;
@@ -166,9 +198,23 @@ export function createSkillResidency(catalog: SkillCatalog) {
 					if (resident) next.add(skill.name);
 				}
 			}
+			// Exact delivered-result evidence: a transformed body matches neither
+			// cached document candidate, so credit the skill only when this same
+			// persisted result still carries the text delivery produced for it and
+			// the skill body is unchanged since.
+			const delivered = message.toolCallId ? deliveredResults.get(message.toolCallId) : undefined;
+			if (delivered && !next.has(delivered.name)) {
+				const skill = catalog.skills.get(delivered.name);
+				const doc = skill?.filePath === delivered.filePath ? skillDocument(skill.filePath) : undefined;
+				if (doc && doc.body === delivered.bodySnapshot && message.text.includes(delivered.text)) next.add(delivered.name);
+			}
 		}
 
 		injectedSkillNames = next;
+		for (const name of next) {
+			if (!queuedSkillNames.delete(name)) continue;
+			reservedSkillNames.delete(name);
+		}
 		reconciledSessionId = sessionId;
 		reconciledLeafId = leafId;
 		reconciledSkills = catalog.skills;
@@ -177,6 +223,9 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	return {
 		hasKnown,
 		reserve,
+		reserveQueued,
+		isQueued,
+		recordDeliveredResult,
 		releaseSkills,
 		releaseAll,
 		releaseToolCall,

@@ -1,3 +1,4 @@
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { describe, it, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -605,6 +606,7 @@ describe("pi-docs extension wiring (src/index.ts)", () => {
 		const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 		let loaded: Array<{ name: string; source: string; sourceInfo: { path: string } }> = [];
 		const extension = {
+			events: createEventBus(),
 			on(event: string, handler: (...args: unknown[]) => unknown) {
 				const list = handlers.get(event) ?? [];
 				list.push(handler);

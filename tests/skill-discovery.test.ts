@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createEventBus, SessionManager } from "@earendil-works/pi-coding-agent";
 import { cliSkillPaths, resultConfirmsSkillBody } from "../src/index";
 
 /**
@@ -31,6 +31,7 @@ function makeFakePi(cwd: string, trusted: boolean) {
 	const sessionManager = SessionManager.inMemory(cwd);
 	const ctx: FakeContext = { cwd, isProjectTrusted: () => trusted, hasUI: false, sessionManager };
 	const pi = {
+		events: createEventBus(),
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 		},

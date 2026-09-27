@@ -7,6 +7,7 @@ import {
 	hasAutoInjectableGlobs,
 	homePath,
 	matchesGlobs,
+	normalizeSkillText,
 	realpathOrResolve,
 	resultConfirmsSkillBody,
 	resultConfirmsFullSkillBody,
@@ -401,6 +402,13 @@ export function createSkillDelivery(deps: {
 			// restoration, and the override is active for the next LLM call.
 			if (plan.modelOverride) {
 				await applyOverrides(plan.modelOverride, ctx);
+			}
+
+			// Dynamic placeholders can change a complete body's text. Record the
+			// whole result, since the body may span blocks; residency must verify
+			// that all of it survived later handlers and reached the transcript.
+			if (changed && skill && plan.directBodyComplete && plan.directDoc && event.toolCallId) {
+				residency.recordDeliveredResult(event.toolCallId, skill.name, plan.directDoc, normalizeSkillText(contentText(content)));
 			}
 
 			if (completedByThisResult.size > 0 && event.toolCallId) {

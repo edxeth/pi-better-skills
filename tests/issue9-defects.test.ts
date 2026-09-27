@@ -2,7 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createEventBus, SessionManager } from "@earendil-works/pi-coding-agent";
 import { cliSkillsOnly } from "../src/index";
 
 /**
@@ -79,6 +79,7 @@ function makeFakePi(cwd: string) {
 	};
 	const calls: string[] = [];
 	const pi: Record<string, unknown> = {
+		events: createEventBus(),
 		on: (event: string, handler: Handler) => {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
 		},

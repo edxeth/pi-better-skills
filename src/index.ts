@@ -11,6 +11,7 @@ import { createSkillDelivery, insertSkillContext, type DeliveryEvent } from "./s
 import { createSkillFirstRead } from "./skill-first-read";
 import { collectSkillReferences, hasResolvableReference, neutralizeDynamicPlaceholders, type RefDeps } from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
+import { registerSkillApi, type SkillDeliveryOutcome } from "./skill-events";
 
 export { cliSkillPaths, cliSkillsOnly, resultConfirmsSkillBody } from "./skill-catalog";
 
@@ -81,7 +82,7 @@ function renderInlineSkillBatch(message: { details?: unknown }, options: { expan
 	return container;
 }
 
-function inlineSkillMessage(skill: InlineSkillDisplay): {
+function inlineSkillMessage(skills: InlineSkillDisplay[]): {
 	customType: "skill";
 	content: string;
 	display: true;
@@ -89,9 +90,9 @@ function inlineSkillMessage(skill: InlineSkillDisplay): {
 } {
 	return {
 		customType: "skill",
-		content: skill.block,
+		content: inlineSkillsIntoText("", skills),
 		display: true,
-		details: { skills: [skill] },
+		details: { skills },
 	};
 }
 
@@ -338,6 +339,64 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	const delivery = createSkillDelivery({ catalog, residency, applyOverrides: applySkillOverrides });
 	const firstRead = createSkillFirstRead(catalog);
 	let sessionInitialized = false;
+	let apiContext: ExtensionContext | undefined;
+	// API deliveries requested while Pi streams wait for turn_end, after the
+	// turn's sibling tool results have persisted (see deliverRequestedSkills).
+	let pendingApiSkills: InlineSkillDisplay[] = [];
+	// Set by this extension's turn_end flush; cleared at the next agent_start or
+	// turn_start. Pi emits every agent_end after a turn_end with no turn_start
+	// between (agent-loop.js), so a running-agent request while this is set comes
+	// from a later turn_end handler or from agent_end: too late for this turn.
+	let turnFlushed = false;
+
+	/**
+	 * Public API delivery. Idle: Pi appends the message at once and starts no
+	 * turn. Streaming: the batch waits for turn_end, so a parallel sibling tool
+	 * that returns the same SKILL.md cannot add a second body behind a queued one.
+	 * Unsupported timing (no session, or after this turn's flush) gets `unknown`.
+	 */
+	function deliverRequestedSkills(names: string[]): SkillDeliveryOutcome[] {
+		const ctx = apiContext;
+		if (!ctx || (turnFlushed && !ctx.isIdle())) return names.map((name) => ({ name, status: "unknown" }));
+		residency.reconcile(ctx);
+		const outcomes: SkillDeliveryOutcome[] = [];
+		const staged = residency.stagedNames;
+		const direct: InlineSkillDisplay[] = [];
+		for (const name of names) {
+			const skill = catalog.skills.get(name);
+			const doc = skill && skillDocument(skill.filePath);
+			if (!skill || !doc) {
+				outcomes.push({ name, status: "unknown" });
+			} else if (staged.has(name)) {
+				outcomes.push({ name, status: "already-resident" });
+			} else {
+				outcomes.push({ name, status: "delivered" });
+				staged.add(name);
+				// Same decoration as an inline /skill: invocation: passive placeholders plus <skill_context>.
+				direct.push(formatInlineSkillDisplay(skill, insertSkillContext(neutralizeDynamicPlaceholders(doc.body), skill, ctx.cwd)));
+			}
+		}
+		if (direct.length === 0) return outcomes;
+		const batch = commitRefExpansion(direct, delivery.refDeps(ctx.cwd), staged);
+		for (const skill of batch) residency.reserveQueued(skill.name);
+		if (ctx.isIdle()) {
+			pi.sendMessage(inlineSkillMessage(batch));
+			// Idle, Pi appends the entry before sendMessage returns. Reconcile now so the
+			// stored body releases the queued reservation before any tree navigation.
+			residency.reconcile(ctx);
+		} else pendingApiSkills.push(...batch);
+		return outcomes;
+	}
+
+	/** Send streaming API deliveries that no persisted result has supplied meanwhile. */
+	function flushPendingApiSkills(): void {
+		turnFlushed = true;
+		const skills = pendingApiSkills.filter((skill) => residency.isQueued(skill.name));
+		pendingApiSkills = [];
+		if (skills.length > 0) pi.sendMessage(inlineSkillMessage(skills), { triggerTurn: false });
+	}
+
+	registerSkillApi(pi, () => catalog.skillList, deliverRequestedSkills);
 
 		
 
@@ -481,6 +540,8 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionInitialized = true;
+		apiContext = ctx;
+		pendingApiSkills = [];
 		residency.clear();
 		await catalog.bootstrap(ctx.cwd, ctx.isProjectTrusted());
 		residency.reconcile(ctx);
@@ -504,14 +565,30 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		sessionInitialized = false;
+		apiContext = undefined;
+		pendingApiSkills = [];
 		residency.clear();
 		firstRead.clear();
 	});
 
 
+	pi.on("agent_start", async () => {
+		turnFlushed = false;
+	});
+
+	pi.on("turn_start", async () => {
+		turnFlushed = false;
+	});
+
 	pi.on("turn_end", async (_event, ctx) => {
 		if (!sessionInitialized) return;
 		residency.reconcile(ctx);
+		// Extension turn_end handlers run before Pi's own turn_end processing,
+		// which appends messages sent with triggerTurn: false. The message then
+		// persists in this turn even when the run ends or is aborted here.
+		// A supported request (tool execute, streaming response) always precedes
+		// this flush, so nothing stays pending at agent_end.
+		flushPendingApiSkills();
 		residency.releaseAll();
 		firstRead.settle();
 	});
@@ -556,7 +633,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		const { text, messages } = planInlineSkillDelivery({ text: result.text, skills: batch }, Boolean(event.streamingBehavior));
 		const options = event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined;
 		for (const skill of messages) {
-			pi.sendMessage(inlineSkillMessage(skill), options);
+			pi.sendMessage(inlineSkillMessage([skill]), options);
 		}
 
 		return { action: "transform" as const, text };

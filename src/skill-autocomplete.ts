@@ -90,6 +90,11 @@ function skillAutocompleteItem(skill: SkillAutocompleteSkill): AutocompleteItem 
 	};
 }
 
+/** The ranking shared by the main editor and other extension editors. */
+export function skillSuggestions(query: string, skills: SkillAutocompleteSkill[]): AutocompleteItem[] {
+	return fuzzyFilter(skills, query.startsWith("skill:") ? query.slice(6) : query, (skill) => skill.name).map(skillAutocompleteItem);
+}
+
 function isSkillItem(item: AutocompleteItem): boolean {
 	return typeof item.value === "string" && item.value.startsWith("skill:");
 }
@@ -200,7 +205,7 @@ export function setupSkillAutocomplete(ctx: ExtensionContext, getSkills: () => S
 			const currentLine = lines[cursorLine] ?? "";
 			const hit = slashTokenAtCursor(currentLine, cursorCol, cursorLine !== 0);
 			if (!hit) return current.getSuggestions(lines, cursorLine, cursorCol, options);
-			const items = fuzzyFilter(getSkills(), hit.query, (skill) => skill.name).map(skillAutocompleteItem);
+			const items = skillSuggestions(hit.query, getSkills());
 			if (items.length === 0) return current.getSuggestions(lines, cursorLine, cursorCol, options);
 			return { items, prefix: hit.prefix };
 		},
